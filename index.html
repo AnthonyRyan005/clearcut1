@@ -575,12 +575,17 @@ a.btn { text-decoration: none; }
 
       <section class="panel save" aria-labelledby="hSave">
         <h2 class="label" id="hSave">Save <span class="mono" id="outSize">600 × 400 px</span></h2>
+        <div class="seg" role="group" aria-label="What to save">
+          <button type="button" data-kind="cutout" aria-pressed="true">Cutout</button>
+          <button type="button" data-kind="sticker" aria-pressed="false">Sticker</button>
+        </div>
         <div class="saverow">
           <div class="seg" role="group" aria-label="File format">
             <button type="button" data-format="png" aria-pressed="true">PNG</button>
             <button type="button" data-format="jpg" aria-pressed="false">JPG</button>
           </div>
-          <label class="check"><input type="checkbox" id="trim"> Trim to subject</label>
+          <label class="check" id="trimLabel"><input type="checkbox" id="trim"> Trim to subject</label>
+          <label class="check" id="outlineLabel" hidden><input type="checkbox" id="outline" checked> White outline</label>
         </div>
         <p class="hint" id="formatHint">PNG keeps the transparent background.</p>
         <div class="saverow">
@@ -651,7 +656,7 @@ const S = {
   stageW: 0, stageH: 0,
   busy: false, scanStart: 0,
   history: [], future: [], historyBytes: 0,
-  format: 'png', trim: false,
+  format: 'png', trim: false, sticker: false, outline: true,
   objects: [], objSeq: 0, composing: false, composeAgain: false, embedded: false,
   crop: null, draft: null, ratio: 'free', ratioTurned: false,
   timing: null, cutBusy: false,
@@ -1299,6 +1304,22 @@ function render() {
   if (S.mode === 'mask') {
     drawImg(photoCanvas());
     drawMaskOverlay(r);
+  } else if (stickerView()) {
+    const st = stickerImage();
+    ctx.fillStyle = checkerPattern(); ctx.fillRect(r.x, r.y, r.w, r.h);
+    const v = S.view;
+    ctx.save();
+    ctx.setTransform(dpr * v.s, 0, 0, dpr * v.s, dpr * (v.x + st.x * v.s), dpr * (v.y + st.y * v.s));
+    ctx.imageSmoothingEnabled = v.s < 2; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(st.canvas, 0, 0);
+    ctx.restore();
+    if (comparing) {
+      const x = splitX(r);
+      ctx.save(); ctx.beginPath(); ctx.rect(0, 0, x, canvas.height); ctx.clip();
+      ctx.fillStyle = tok.chkA || '#fff'; ctx.fillRect(r.x, r.y, r.w, r.h);
+      drawImg(S.origCanvas);
+      ctx.restore();
+    }
   } else {
     drawBackground(r, full);
     if (S.bg !== 'photo') drawImg(S.cutCanvas);
@@ -1468,7 +1489,7 @@ function setPhoto(p) {
   S.photoId++;
   S.w = p.w; S.h = p.h; S.name = p.name; S.isExample = p.isExample;
   S.origCanvas = p.origCanvas; S.orig = p.orig;
-  S.cut = null; S.mask = null; S.blurCanvas = null; boxCache = null;
+  S.cut = null; S.mask = null; S.blurCanvas = null; boxCache = null; stickerCache = null;
   S.cutCanvas = makeCanvas(p.w, p.h);
   S.cutCtx = S.cutCanvas.getContext('2d');
   S.history = []; S.future = []; S.historyBytes = 0;
@@ -1490,7 +1511,7 @@ function setPhoto(p) {
 function setCut(buf) {
   S.cut = new ImageData(new Uint8ClampedArray(buf), S.w, S.h);
   S.cutCtx.putImageData(S.cut, 0, 0);
-  S.blurCanvas = null; boxCache = null;
+  S.blurCanvas = null; boxCache = null; stickerCache = null;
   updateUI(); schedule();
 }
 
@@ -1711,7 +1732,7 @@ function applyBase(buf) {
   S.cut = new ImageData(new Uint8ClampedArray(buf), S.w, S.h);
   replayHistory();
   S.cutCtx.putImageData(S.cut, 0, 0);
-  S.blurCanvas = null; boxCache = null;
+  S.blurCanvas = null; boxCache = null; stickerCache = null;
 }
 
 /* ---------- touch-up brush ---------- */
@@ -1824,7 +1845,7 @@ function endStroke() {
   flushDirty();
   if (stroke.tiles.size) pushHistory(closeStroke(stroke));
   stroke = null;
-  S.blurCanvas = null; boxCache = null;
+  S.blurCanvas = null; boxCache = null; stickerCache = null;
   updateUI();
 }
 /* Re-apply every kept step after the base cutout changed (new picks). */
@@ -1856,7 +1877,7 @@ function applyTiles(map) {
     b = b ? { x0: Math.min(b.x0, r.x0), y0: Math.min(b.y0, r.y0), x1: Math.max(b.x1, r.x1), y1: Math.max(b.y1, r.y1) } : r;
   }
   if (b) S.cutCtx.putImageData(S.cut, 0, 0, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
-  S.blurCanvas = null; boxCache = null;
+  S.blurCanvas = null; boxCache = null; stickerCache = null;
   schedule();
 }
 const locked = () => S.busy || S.cutBusy || S.composing || S.removing || !!stroke || saving;
@@ -2066,7 +2087,7 @@ function writePhoto(rect, data) {
   const d = S.orig.data;
   for (let y = 0; y < rect.h; y++) d.set(data.subarray(y * rect.w * 4, (y + 1) * rect.w * 4), ((rect.y + y) * S.w + rect.x) * 4);
   S.editCtx.putImageData(new ImageData(data, rect.w, rect.h), rect.x, rect.y);
-  S.blurCanvas = null; boxCache = null;
+  S.blurCanvas = null; boxCache = null; stickerCache = null;
 }
 /* Undo (forward = false) or redo one removal step. */
 function stepRemoval(e, forward) {
@@ -2330,7 +2351,7 @@ function applyCrop() {
   S.crop = (d.x === 0 && d.y === 0 && d.w === S.w && d.h === S.h) ? null : d;
   S.draft = null;
   $('cropBar').hidden = true;
-  boxCache = null;
+  boxCache = null; stickerCache = null;
 }
 function cancelCrop() { S.draft = null; $('cropBar').hidden = true; }
 function cropHandleAt(p) {
@@ -2621,6 +2642,96 @@ window.addEventListener('paste', (e) => {
   if (it) { e.preventDefault(); const f = it.getAsFile(); if (f) handleFile(new File([f], f.name || 'Pasted image.png', { type: f.type })); }
 });
 
+/* ---------- sticker ---------- */
+/* Squared distance to the nearest zero, in place (Felzenszwalb and
+   Huttenlocher). Zeros mark solid subject pixels. */
+function edt1d(f, n, d, v, z) {
+  let k = 0;
+  v[0] = 0; z[0] = -Infinity; z[1] = Infinity;
+  for (let q = 1; q < n; q++) {
+    let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+    k++; v[k] = q; z[k] = s; z[k + 1] = Infinity;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) {
+    while (z[k + 1] < q) k++;
+    const dq = q - v[k];
+    d[q] = dq * dq + f[v[k]];
+  }
+}
+function edt2d(g, w, h) {
+  const n = Math.max(w, h);
+  const f = new Float32Array(n), d = new Float32Array(n), v = new Int32Array(n), z = new Float32Array(n + 1);
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) f[y] = g[y * w + x];
+    edt1d(f, h, d, v, z);
+    for (let y = 0; y < h; y++) g[y * w + x] = d[y];
+  }
+  for (let y = 0; y < h; y++) {
+    const o = y * w;
+    for (let x = 0; x < w; x++) f[x] = g[o + x];
+    edt1d(f, w, d, v, z);
+    for (let x = 0; x < w; x++) g[o + x] = d[x];
+  }
+}
+/* Outline width: about 2% of the subject's longest side. */
+const stickerRadius = (box) => (S.outline ? Math.max(4, Math.round(Math.max(box.w, box.h) * 0.022)) : 0);
+let stickerCache = null;
+/* The subject alone, trimmed to its edges, with a white outline if chosen.
+   Straight (not premultiplied) RGBA, plus where it sits in the photo. */
+function stickerImage() {
+  const region = S.crop || fullRect();
+  const key = [S.history.length, S.future.length, region.x, region.y, region.w, region.h, S.outline].join(':');
+  if (stickerCache && stickerCache.cut === S.cut && stickerCache.key === key) return stickerCache.st;
+  const box = subjectBox(region);
+  const rad = stickerRadius(box), m = rad ? rad + 2 : 0;
+  const w = box.w + 2 * m, h = box.h + 2 * m, W = S.w;
+  const src = S.cut.data, out = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < box.h; y++) {
+    const so = ((box.y + y) * W + box.x) * 4;
+    out.set(src.subarray(so, so + box.w * 4), ((y + m) * w + m) * 4);
+  }
+  if (rad) {
+    const n = w * h, dist = new Float32Array(n);
+    for (let i = 0; i < n; i++) dist[i] = out[i * 4 + 3] >= 128 ? 0 : 1e20;
+    edt2d(dist, w, h);
+    for (let i = 0; i < n; i++) {
+      const ao = rad + 0.5 - Math.sqrt(dist[i]);
+      if (ao <= 0) continue;
+      const a = ao >= 1 ? 1 : ao, p = i * 4, as = out[p + 3] / 255;
+      const A = as + a * (1 - as);
+      // white outline underneath the subject's soft edge
+      out[p] = (out[p] * as + 255 * a * (1 - as)) / A;
+      out[p + 1] = (out[p + 1] * as + 255 * a * (1 - as)) / A;
+      out[p + 2] = (out[p + 2] * as + 255 * a * (1 - as)) / A;
+      out[p + 3] = A * 255;
+    }
+  }
+  const canvas = makeCanvas(w, h);
+  canvas.getContext('2d').putImageData(new ImageData(out, w, h), 0, 0);
+  const st = { rgba: out, canvas, w, h, x: box.x - m, y: box.y - m };
+  stickerCache = { cut: S.cut, key, st };
+  return st;
+}
+/* The sticker preview replaces the result view while no brush is in use. */
+const stickerView = () => S.sticker && !!S.cut && !BRUSH_TOOLS[S.tool] && S.tool !== 'remove' && S.tool !== 'pick';
+/* JPG can't be see-through: a sticker JPG sits on the chosen colour, or white. */
+const stickerJpgColour = () => (S.bg === 'custom' ? S.bgColor : /^#/.test(S.bg) ? S.bg : '#ffffff');
+async function stickerBlob(fmt) {
+  const st = stickerImage();
+  if (fmt === 'png') {
+    const buf = st.rgba.slice().buffer;
+    const res = await rpc('png', { rgba: buf, w: st.w, h: st.h, crop: { x: 0, y: 0, w: st.w, h: st.h } }, [buf]);
+    if (!res.blob) throw new Error(res.error || 'PNG encoding failed');
+    return { blob: res.blob, crop: { x: st.x, y: st.y, w: st.w, h: st.h } };
+  }
+  const c = makeCanvas(st.w, st.h), x = c.getContext('2d');
+  x.fillStyle = stickerJpgColour(); x.fillRect(0, 0, st.w, st.h);
+  x.drawImage(st.canvas, 0, 0);
+  return { blob: await toBlob(c, 'image/jpeg', 0.92), crop: { x: st.x, y: st.y, w: st.w, h: st.h } };
+}
+
 /* ---------- export ---------- */
 function subjectBox(region) {
   const d = S.cut.data, W = S.w;
@@ -2643,6 +2754,7 @@ function cropBox() {
 }
 function toBlob(c, type, q) { return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('Encoding failed'))), type, q)); }
 async function exportBlob(fmt) {
+  if (S.sticker) return stickerBlob(fmt);
   const crop = cropBox();
   if (S.bg === 'transparent' && fmt === 'png') {
     const buf = S.cut.data.buffer;
@@ -2651,7 +2763,7 @@ async function exportBlob(fmt) {
     try {
       const res = await rpc('png', { rgba: buf, w: W, h: H, crop }, [buf]);
       S.cut = new ImageData(new Uint8ClampedArray(res.rgba), W, H);
-      boxCache = null;
+      boxCache = null; stickerCache = null;
       if (!res.blob) throw new Error(res.error || 'PNG encoding failed');
       return { blob: res.blob, crop };
     } finally { S.cutBusy = false; }
@@ -2681,7 +2793,7 @@ async function save() {
   btn.textContent = 'Preparing…';
   try {
     const { blob } = await exportBlob(fmt);
-    const filename = baseName(S.isExample ? 'espresso-example' : S.name) + (S.bg === 'photo' ? '-edited.' : '-cutout.') + (fmt === 'jpg' ? 'jpg' : 'png');
+    const filename = baseName(S.isExample ? 'espresso-example' : S.name) + (S.sticker ? '-sticker.' : S.bg === 'photo' ? '-edited.' : '-cutout.') + (fmt === 'jpg' ? 'jpg' : 'png');
     if (STANDALONE) { standaloneSave(blob, filename); return; }
     const dl = await downloadsReady;
     if (!dl) { showSaveSheet(blob, filename); return; }
@@ -2711,7 +2823,7 @@ function showSaveSheet(blob, filename) {
   $('saveFile').textContent = `${filename} · ${fmtMB(blob.size)}`;
   if (STANDALONE) {
     const canShare = !!(navigator.canShare && navigator.canShare({ files: [sheetFile] }));
-    $('saveTitle').textContent = S.bg === 'photo' ? 'Your photo is ready' : 'Your cutout is ready';
+    $('saveTitle').textContent = S.sticker ? 'Your sticker is ready' : S.bg === 'photo' ? 'Your photo is ready' : 'Your cutout is ready';
     $('saveHelp').textContent = canShare
       ? 'Tap Save or share, then choose Save Image to add it to Photos, or Save to Files.'
       : 'Use Download to save the file. You can also press and hold the image.';
@@ -2763,7 +2875,7 @@ function updateUI() {
   const ready = !!S.cut && !S.busy;
   $('saveBtn').disabled = !ready || saving || S.composing || S.removing;
   $('copyBtn').disabled = !ready || saving || S.composing || S.removing;
-  if (!saving) $('saveBtn').textContent = S.format === 'jpg' ? 'Save JPG' : 'Save PNG';
+  if (!saving) $('saveBtn').textContent = (S.sticker ? 'Save sticker ' : 'Save ') + (S.format === 'jpg' ? 'JPG' : 'PNG');
   $('undoBtn').disabled = !ready || !S.history.length || S.composing || S.removing;
   $('redoBtn').disabled = !ready || !S.future.length || S.composing || S.removing;
   $('resetBtn').disabled = !ready || !hasTouchUps() || S.composing || S.removing;
@@ -2783,10 +2895,14 @@ function updateUI() {
   $('keepClear').disabled = !ready || !S.objects.length || S.composing;
   const n = S.objects.length;
   $('keepCount').textContent = n ? `${n} picked` : 'All found';
-  if (S.w) { const b = cropBox(); $('outSize').textContent = fmtPx(b.w, b.h); }
+  if (S.w) { const b = S.sticker && S.cut ? stickerImage() : cropBox(); $('outSize').textContent = fmtPx(b.w, b.h); }
   const names = { transparent: 'Transparent', photo: 'Photo', '#ffffff': 'White', '#111111': 'Black', '#e8e2d6': 'Stone', custom: S.bgColor.toUpperCase(), blur: 'Blurred original' };
   $('bgName').textContent = names[S.bg] || S.bg;
-  $('formatHint').textContent = S.format === 'jpg'
+  $('formatHint').textContent = S.sticker
+    ? (S.format === 'jpg'
+      ? `Only the subject, trimmed to its edges. JPG can't be see-through, so the corners are ${stickerJpgColour() === '#ffffff' ? 'white' : 'your background colour'}. Choose PNG for nothing around it.`
+      : 'Only the subject, trimmed to its edges, with nothing around it. On iPhone or iPad, save it to Photos, open it, touch and hold the subject, then tap Add Sticker.')
+    : S.format === 'jpg'
     ? (S.bg === 'transparent' ? 'JPG has no transparency, so the background is saved as white.' : 'JPG files are smaller. The background is saved as shown.')
     : (S.bg === 'transparent' ? 'PNG keeps the transparent background.' : S.bg === 'photo' ? 'PNG of the whole photo, with your edits.' : 'PNG with the background shown.');
   updateCropUI();
@@ -2811,7 +2927,7 @@ $('cropFlip').addEventListener('click', () => {
 });
 $('cropReset').addEventListener('click', () => {
   if (S.tool === 'crop') { S.draft = fitRatio(fullRect(), ratioValue()); updateCropUI(); schedule(); return; }
-  S.crop = null; boxCache = null; S.view.fit = true; fitView(); updateUI(); schedule();
+  S.crop = null; boxCache = null; stickerCache = null; S.view.fit = true; fitView(); updateUI(); schedule();
 });
 $('cropApply').addEventListener('click', () => setTool('move'));
 $('cropCancel').addEventListener('click', () => { cancelCrop(); setTool('move'); });
@@ -2885,6 +3001,26 @@ for (const b of document.querySelectorAll('[data-gap]')) b.setAttribute('aria-pr
 $('rmQualityRow').hidden = S.gap === 'clear' || PHONE;
 for (const b of document.querySelectorAll('[data-quality]')) b.setAttribute('aria-pressed', String(b.dataset.quality === S.quality));
 $('trim').addEventListener('change', (e) => { S.trim = e.target.checked; updateUI(); });
+function setSticker(on) {
+  S.sticker = !!on;
+  for (const b of document.querySelectorAll('[data-kind]')) b.setAttribute('aria-pressed', String((b.dataset.kind === 'sticker') === S.sticker));
+  $('trimLabel').hidden = S.sticker;
+  $('outlineLabel').hidden = !S.sticker;
+  try { localStorage.setItem('clearcut.sticker', S.sticker ? '1' : '0'); } catch (e) { /* private mode */ }
+  if (S.sticker && S.mode === 'mask') setMode('result');
+  updateUI(); schedule();
+}
+for (const b of document.querySelectorAll('[data-kind]')) b.addEventListener('click', () => setSticker(b.dataset.kind === 'sticker'));
+$('outline').addEventListener('change', (e) => {
+  S.outline = e.target.checked;
+  try { localStorage.setItem('clearcut.outline', S.outline ? '1' : '0'); } catch (err) { /* private mode */ }
+  updateUI(); schedule();
+});
+try {
+  S.outline = localStorage.getItem('clearcut.outline') !== '0';
+  $('outline').checked = S.outline;
+  if (localStorage.getItem('clearcut.sticker') === '1') setSticker(true);
+} catch (e) { /* private mode */ }
 $('undoBtn').addEventListener('click', undo);
 $('redoBtn').addEventListener('click', redo);
 $('resetBtn').addEventListener('click', resetEdits);
@@ -2921,7 +3057,7 @@ if (STANDALONE && 'serviceWorker' in navigator) {
 }
 if (coarse) $('keepHint').textContent = 'Tap each object you want to keep. Everything else is removed. Tap the dot on an object to drop it.';
 if (coarse) $('rmHint').textContent = 'Tap each object you want to remove, or brush over smaller things like wires and marks. Tap a red area again to unselect it. Then tap Remove.';
-window.__clearcut = { S, engine, picker, fillers, describer, done: 0, picks: 0, selects: 0, removals: 0, describes: 0, errors: [], handleFile, pickAt, rmTap, removeSelected, restorePhoto, undo, redo, setBg, toScreen, setTool };
+window.__clearcut = { S, engine, picker, fillers, describer, stickerImage: () => stickerImage(), resetSticker: () => { stickerCache = null; }, done: 0, picks: 0, selects: 0, removals: 0, describes: 0, errors: [], handleFile, pickAt, rmTap, removeSelected, restorePhoto, undo, redo, setBg, toScreen, setTool };
 readTokens();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readTokens);
 new MutationObserver(readTokens).observe(root, { attributes: true, attributeFilter: ['data-theme', 'class', 'style'] });
