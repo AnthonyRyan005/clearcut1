@@ -31,11 +31,11 @@ After that, Clearcut keeps working offline.
 - **Change the background.** Choose transparent, the photo itself, white, black, stone, any colour or a blur of the original.
 - **Save.** Tap **Save PNG** or **Save JPG**, then **Save or share**. Choose **Save Image** to add it to Photos, or **Save to Files**.
 
-## What your iPad needs
+## iPad, iPhone and computers
 
-- iPadOS 26 or later gives the fastest results, because Safari can use the graphics chip. A photo takes a few seconds.
-- Older versions run the models on the processor. A photo then takes about a minute.
-- Clearcut also works in current Chrome, Edge, Firefox and Safari on a computer.
+- On iPad and iPhone, the models run on the processor. Safari 26 runs out of memory with the graphics-chip version of the model runtime, so Clearcut uses the processor version there. A photo takes about 20 to 60 seconds.
+- On iPhone, Clearcut works on photos at up to 6 megapixels and uses the Fast fill by default. This keeps it within the memory an iPhone gives a web app.
+- On a computer, Chrome and Edge use the graphics chip, so a photo takes a few seconds. Firefox and Safari also work.
 
 ## Publish it with GitHub Pages
 
@@ -44,13 +44,13 @@ You can do this in your browser on a computer. You don't need Git.
 1. On GitHub, select **New repository**. Name it `clearcut`, choose **Public**, then select **Create repository**.
 2. On the empty repository page, select **uploading an existing file**.
 3. Unzip `clearcut-ipad.zip`. Open the `clearcut` folder, select everything inside it, and drag it all onto the upload page. GitHub keeps the folders (`m`, `vendor`, `icons`, `licenses`) as they are.
-4. Wait for every file to finish uploading (about 477 MB), then select **Commit changes**.
+4. Wait for every file to finish uploading (about 480 MB), then select **Commit changes**.
 5. Open **Settings**, then **Pages**. Under **Build and deployment**, set **Source** to **Deploy from a branch**. Choose `main` and `/ (root)`, then select **Save**.
 6. After a minute or two, your app is live at `https://YOUR-NAME.github.io/clearcut/`. Replace `YOUR-NAME` with your GitHub username.
 
 Drag the files inside the folder, not the folder itself. If you drag the folder, the address gets an extra `/clearcut/` at the end.
 
-The web uploader accepts up to 100 files at a time and 25 MB per file. This app has 67 files and the largest is 14 MB.
+The web uploader accepts up to 100 files at a time and 25 MB per file. This app has 70 files and the largest is 14 MB.
 
 A private repository needs a paid GitHub plan to use Pages. A public repository works on every plan.
 

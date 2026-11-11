@@ -233,7 +233,7 @@ button { cursor: pointer; }
 @keyframes slide { 0% { left: -30%; } 100% { left: 100%; } }
 .pnote { margin: 0; font-size: 12.5px; color: var(--ink-soft); }
 .pnote:empty { display: none; }
-.perr { margin: 0; font-size: 13px; color: var(--ruby); }
+.perr { margin: 0; font-size: 13px; color: var(--ruby); white-space: pre-line; overflow-wrap: anywhere; }
 .prow { display: flex; gap: 8px; }
 
 .toast {
@@ -626,7 +626,14 @@ const coarse = matchMedia('(pointer: coarse)').matches;
 const smallScreen = Math.min(screen.width || 9999, screen.height || 9999) < 900;
 const STANDALONE = !!window.__CLEARCUT_STANDALONE__;
 const IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
-const MAX_PIXELS = coarse || IOS ? 12e6 : 16.7e6;
+/* Safari (every browser on iPhone and iPad uses its engine). ONNX Runtime's
+   graphics-chip build makes Safari 26 use gigabytes of memory while it compiles
+   it, so Safari gets the plain processor build instead. ?cpuonly forces the
+   same path in other browsers, for testing. */
+const WEBKIT = IOS || (/Safari\//.test(navigator.userAgent) && /Version\//.test(navigator.userAgent) && !/Chrome|Chromium|Edg|OPR|Firefox/.test(navigator.userAgent)) || /[?&]cpuonly\b/.test(location.search);
+const PHONE = IOS && smallScreen;
+/* iPhones have the least memory, so photos are worked on at up to 6 megapixels there. */
+const MAX_PIXELS = PHONE ? 6e6 : coarse || IOS ? 12e6 : 16.7e6;
 const MAX_SIDE = 8192;
 const TILE = 128;
 const BRUSH_TOOLS = { erase: 1, restore: 1 };
@@ -699,11 +706,41 @@ function startWorker() {
     pending.clear();
   };
 }
+/* Safari: a page may only use about 1.5 GB on iPhone (more on iPad), and the
+   background model takes about 1 GB of it while loaded. After a cutout, start a
+   fresh processing worker so that memory is given back, then rebuild the photo
+   state there from the saved mask. The model reloads from this device for the
+   next photo. */
+async function recycleWorker() {
+  if (!S.mask || !S.orig || S.busy) return;
+  const id = S.photoId;
+  worker.terminate();
+  for (const p of pending.values()) p.reject(new Error('The processing worker restarted.'));
+  pending.clear();
+  startWorker();
+  engine.state = 'idle'; engine.promise = null;
+  setEngine('idle', engine.cached ? 'Model saved in this browser' : 'Model loads on first use');
+  picker.state = 'idle'; picker.promise = null;
+  for (const k of Object.keys(fillers)) { fillers[k].state = 'idle'; fillers[k].promise = null; }
+  S.embedded = false; embedPromise = null;
+  const rgba = S.orig.data.slice().buffer, mask = S.mask.slice().buffer;
+  workerReady = rpc('refine', { rgba, w: S.w, h: S.h, mask }, [rgba, mask]).then(() => {}, (e) => {
+    if (id === S.photoId) toast("Couldn't restore the photo for editing: " + e.message, 4600);
+  });
+  await workerReady;
+}
+let workerReady = Promise.resolve();
 /* Requests that load or run a large model. Before these, an idle describe
    worker is closed so the two never hold their memory at the same time. */
 const HEAVY = new Set(['init', 'samInit', 'samEmbed', 'fillInit', 'cutout', 'removeFill']);
 function rpc(type, payload, transfer, onProgress) {
   if (HEAVY.has(type)) { try { releaseDescriber(); } catch (e) { /* describe state not set up yet */ } }
+  if (type !== 'refine' && type !== 'init' && type !== 'cutout') {
+    return workerReady.then(() => rawRpc(type, payload, transfer, onProgress));
+  }
+  return rawRpc(type, payload, transfer, onProgress);
+}
+function rawRpc(type, payload, transfer, onProgress) {
   return new Promise((resolve, reject) => {
     const id = ++rpcSeq;
     pending.set(id, { resolve, reject, onProgress });
@@ -815,7 +852,7 @@ function setEngine(state, text) {
     : pct ? 'Model ' + pct[1] : 'Model…';
 }
 async function pickDevice(minBinding) {
-  if (!('gpu' in navigator)) return 'cpu';
+  if (WEBKIT || !('gpu' in navigator)) return 'cpu';
   try {
     const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!a) return 'cpu';
@@ -838,21 +875,26 @@ function ensureEngine(report) {
     engine.cached = !!(files && files.pack && files.pack.size > 0);
     if (!engine.cached) {
       setEngine('busy', 'Downloading model');
-      const list = m.chunks.concat([m.graph, m.runtime]);
+      const list = m.chunks.concat([m.graph, plainRuntime(m) ? m.runtimeCpu : m.runtime]);
       const blobs = await fetchAll(list, (d, t) => {
         setEngine('busy', `Downloading model · ${Math.floor((d / t) * 100)}%`);
         say('download', { done: d, total: t });
       });
       const n = m.chunks.length;
-      files = { pack: new Blob(blobs.slice(0, n)), graph: blobs[n], runtime: blobs[n + 1] };
+      files = { pack: new Blob(blobs.slice(0, n)), graph: blobs[n] };
+      if (plainRuntime(m)) { runtimeBlob = blobs[n + 1]; idbPut('rtcpu:' + m.ort, runtimeBlob); }
+      else files.runtime = blobs[n + 1];
       idbPut(key, files).then((ok) => { if (ok) engine.cached = true; });
     } else say('cached', {});
-    runtimeBlob = files.runtime;
+    const runtime = plainRuntime(m) ? await getRuntime(m) : files.runtime;
+    if (!plainRuntime(m)) runtimeBlob = runtime;
     setEngine('busy', 'Starting model');
     say('start', {});
     const device = await pickDevice(134217728);
-    const res = await rpc('init', { manifest: packMan(m), pack: files.pack, graph: files.graph, runtime: files.runtime, device }, [], (p) => say('init', p));
+    const res = await rpc('init', { manifest: packMan(m), pack: files.pack, graph: files.graph, runtime, plain: plainRuntime(m), device }, [], (p) => say('init', p));
     engine.device = res.device;
+    engine.note = res.note || '';
+    engine.plain = !!res.plain;
     setEngine('ready', res.device === 'gpu' ? 'Model ready · GPU' : 'Model ready · CPU');
   })().catch((e) => {
     engine.promise = null;
@@ -886,8 +928,17 @@ function updateChip() {
   $('rmHud').disabled = S.sel.some((i) => i.pending);
   $('tryBtn').hidden = !S.isExample || !!t || !$('rmHud').hidden;
 }
+/* True when this browser should use ONNX Runtime's plain processor build. */
+const plainRuntime = (m) => WEBKIT && !!m.runtimeCpu;
 async function getRuntime(m) {
   if (runtimeBlob) return runtimeBlob;
+  if (plainRuntime(m)) {
+    const rt = await idbGet('rtcpu:' + m.ort);
+    if (rt) { runtimeBlob = rt; return rt; }
+    runtimeBlob = (await fetchAll([m.runtimeCpu], () => {}))[0];
+    idbPut('rtcpu:' + m.ort, runtimeBlob);
+    return runtimeBlob;
+  }
   const cached = await idbGet(m.version + ':' + m.sha);
   if (cached && cached.runtime) { runtimeBlob = cached.runtime; return runtimeBlob; }
   const rt = await idbGet('rt:' + m.ort);
@@ -920,7 +971,7 @@ function ensurePicker() {
     samSay('Starting the object model');
     const device = await pickDevice(268435456);
     const res = await rpc('samInit', {
-      runtime, device,
+      runtime, device, plain: plainRuntime(m),
       enc: { pack: files.encPack, graph: files.encGraph, man: packMan(sm.enc) },
       dec: { pack: files.decPack, graph: files.decGraph, man: packMan(sm.dec) },
     });
@@ -977,7 +1028,7 @@ function ensureFill(kind) {
     const runtime = await getRuntime(m);
     removeStatus(`Starting ${label}`);
     const device = await pickDevice(134217728);
-    const res = await rpc('fillInit', { kind, runtime, device, pack: files.pack, graph: files.graph, man: packMan(fm) });
+    const res = await rpc('fillInit', { kind, runtime, device, plain: plainRuntime(m), pack: files.pack, graph: files.graph, man: packMan(fm) });
     f.device = res.device;
     f.state = 'ready';
   })().catch((e) => { f.promise = null; f.state = 'error'; throw e; });
@@ -1409,10 +1460,15 @@ async function decodeFile(file) {
   } finally { URL.revokeObjectURL(url); }
 }
 function setPhoto(p) {
+  // Free the previous photo's canvases now. Safari otherwise keeps their memory
+  // until it next cleans up, which can push an iPhone over its limit.
+  for (const c of [S.cutCanvas, S.editCanvas, S.blurCanvas, S.isExample ? null : S.origCanvas]) {
+    if (c && c !== p.origCanvas) { c.width = 0; c.height = 0; }
+  }
   S.photoId++;
   S.w = p.w; S.h = p.h; S.name = p.name; S.isExample = p.isExample;
   S.origCanvas = p.origCanvas; S.orig = p.orig;
-  S.cut = null; S.blurCanvas = null; boxCache = null;
+  S.cut = null; S.mask = null; S.blurCanvas = null; boxCache = null;
   S.cutCanvas = makeCanvas(p.w, p.h);
   S.cutCtx = S.cutCanvas.getContext('2d');
   S.history = []; S.future = []; S.historyBytes = 0;
@@ -1529,23 +1585,28 @@ async function runCutout() {
     S.timing = res.ms;
     $('factSpeed').textContent = `${fmtSec(res.ms.model + res.ms.refine)} on ${res.device === 'gpu' ? 'GPU' : 'CPU'}`;
     setCut(res.cut);
+    S.mask = res.mask ? new Float32Array(res.mask) : null;
     setBusy(false);
     P.close();
     reveal();
     window.__clearcut.done++;
+    if (WEBKIT) recycleWorker().catch((e) => console.error(e));
   } catch (e) {
     console.error(e);
     if (!S.orig && S.origCanvas) S.orig = S.origCanvas.getContext('2d').getImageData(0, 0, S.w, S.h);
     setBusy(false);
     $('factSpeed').textContent = 'Failed';
-    P.error(friendlyError(e));
-    window.__clearcut.errors.push(String(e && e.message || e));
+    const raw = String((e && e.message) || e);
+    const friendly = friendlyError(e);
+    // The technical detail helps when someone sends a screenshot of the problem.
+    P.error(friendly + (friendly.includes(raw) ? '' : '\nDetails: ' + raw.slice(0, 240)) + (engine.note ? '\nGraphics chip: ' + engine.note.slice(0, 160) : ''));
+    window.__clearcut.errors.push(raw);
   }
 }
 function friendlyError(e) {
   const m = (e && e.message) || String(e);
   if (/model runtime/i.test(m)) return "The model runtime couldn't be loaded from the script CDN. Check your connection and try again.";
-  if (/Download failed|HTTP|Failed to fetch|NetworkError/i.test(m)) return "The model couldn't be downloaded. Check your connection and try again.";
+  if (/Download failed|HTTP|Failed to fetch|NetworkError|Load failed/i.test(m)) return "The model couldn't be downloaded. Check your connection and try again.";
   if (/memory|allocation|OOM|RangeError/i.test(m)) return 'This device ran out of memory. Close other tabs or try a smaller photo.';
   if (/missing features/i.test(m)) return m;
   return 'Something went wrong while processing: ' + m;
@@ -2189,7 +2250,7 @@ function ensureDescriber() {
     await new Promise((resolve, reject) => {
       describer.waitReady = { resolve, reject };
       dsWorker().postMessage({
-        type: 'load', runtime, device,
+        type: 'load', runtime, device, plain: plainRuntime(m),
         enc: { pack: files.encPack, graph: files.encGraph, man: packMan(d.enc) },
         dec: { pack: files.decPack, graph: files.decGraph, man: packMan(d.dec) },
         emb: { pack: files.embPack, man: packMan(d.emb) },
@@ -2794,7 +2855,7 @@ if (!STANDALONE) {
 function setGap(g) {
   S.gap = g === 'clear' ? 'clear' : 'fill';
   for (const b of document.querySelectorAll('[data-gap]')) b.setAttribute('aria-pressed', String(b.dataset.gap === S.gap));
-  $('rmQualityRow').hidden = S.gap === 'clear';
+  $('rmQualityRow').hidden = S.gap === 'clear' || PHONE;
   try { localStorage.setItem('clearcut.gap', S.gap); } catch (e) { /* private mode */ }
   updateQualityHint();
   if (S.tool === 'remove') prepareRemove();
@@ -2817,9 +2878,11 @@ function updateQualityHint() {
 }
 for (const b of document.querySelectorAll('[data-quality]')) b.addEventListener('click', () => setQuality(b.dataset.quality));
 try { const q = localStorage.getItem('clearcut.fill'); if (q) S.quality = q === 'fast' ? 'fast' : 'best'; } catch (e) { /* private mode */ }
+// The Best fill needs more memory than iPhone gives a web page, so iPhone uses Fast.
+if (PHONE) S.quality = 'fast';
 try { const g = localStorage.getItem('clearcut.gap'); if (g) S.gap = g === 'clear' ? 'clear' : 'fill'; } catch (e) { /* private mode */ }
 for (const b of document.querySelectorAll('[data-gap]')) b.setAttribute('aria-pressed', String(b.dataset.gap === S.gap));
-$('rmQualityRow').hidden = S.gap === 'clear';
+$('rmQualityRow').hidden = S.gap === 'clear' || PHONE;
 for (const b of document.querySelectorAll('[data-quality]')) b.setAttribute('aria-pressed', String(b.dataset.quality === S.quality));
 $('trim').addEventListener('change', (e) => { S.trim = e.target.checked; updateUI(); });
 $('undoBtn').addEventListener('click', undo);
@@ -2869,7 +2932,7 @@ try { startWorker(); } catch (e) { console.error(e); }
 (async () => {
   try {
     const m = await loadManifest();
-    engine.total = m.chunks.reduce((a, c) => a + c[1], 0) + m.graph[1] + m.runtime[1];
+    engine.total = m.chunks.reduce((a, c) => a + c[1], 0) + m.graph[1] + (plainRuntime(m) ? m.runtimeCpu : m.runtime)[1];
     updateQualityHint();
     const cached = await idbGet(m.version + ':' + m.sha);
     if (cached && cached.pack) { engine.cached = true; setEngine('idle', 'Model saved in this browser'); }

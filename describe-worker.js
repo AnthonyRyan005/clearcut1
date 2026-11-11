@@ -15,7 +15,7 @@ const TASKS = {
   short: ['<CAPTION>', 60],
 };
 
-let rt = null, model = null, stopRequested = false;
+let rt = null, model = null, stopRequested = false, plainOrt = false;
 const post = (m) => self.postMessage(m);
 
 async function gunzip(blob) {
@@ -47,13 +47,15 @@ function buildWeights(packBuf, man) {
   }
   return u8;
 }
-async function loadOrt(runtimeBlob) {
+/* plain: ONNX Runtime's processor-only build, for Safari (see worker.js). */
+async function loadOrt(runtimeBlob, plain) {
   if (rt) return;
-  importScripts(ORT_BASE + 'ort.webgpu.min.js');
+  plainOrt = !!plain;
+  importScripts(ORT_BASE + (plainOrt ? 'ort.wasm.min.js' : 'ort.webgpu.min.js'));
   rt = self.ort;
   rt.env.wasm.numThreads = 1;
   rt.env.wasm.proxy = false;
-  rt.env.wasm.wasmPaths = { mjs: ORT_BASE + 'ort-wasm-simd-threaded.jsep.js' };
+  rt.env.wasm.wasmPaths = { mjs: ORT_BASE + (plainOrt ? 'ort-wasm-simd-threaded.js' : 'ort-wasm-simd-threaded.jsep.js') };
   rt.env.wasm.wasmBinary = await gunzip(runtimeBlob);
   rt.env.logLevel = 'error';
   if (rt.env.webgpu) rt.env.webgpu.powerPreference = 'high-performance';
@@ -68,7 +70,7 @@ async function createSessions(files, dev) {
   // No per-session memory arena: the two sessions then share one pool of
   // memory instead of each keeping its own high-water mark.
   const opts = (weights, extra) => Object.assign({
-    executionProviders: [dev === 'gpu' ? 'webgpu' : 'wasm'],
+    executionProviders: [dev === 'gpu' && !plainOrt ? 'webgpu' : 'wasm'],
     graphOptimizationLevel: 'all',
     enableCpuMemArena: false,
     externalData: [{ path: 'weights.bin', data: weights }],
@@ -84,13 +86,13 @@ async function createSessions(files, dev) {
 }
 
 async function load(m) {
-  await loadOrt(m.runtime);
+  await loadOrt(m.runtime, m.plain);
   post({ type: 'status', text: 'Starting the description model' });
   const info = m.info;
   const embBuf = buildWeights(await gunzip(m.emb.pack), m.emb.man).buffer;
   const rows = info.rows, dim = info.dim, nb = dim / info.block;
   const vocab = JSON.parse(new TextDecoder().decode(await gunzip(m.vocab)));
-  let device = m.device === 'gpu' && self.navigator && self.navigator.gpu ? 'gpu' : 'cpu';
+  let device = m.device === 'gpu' && !plainOrt && self.navigator && self.navigator.gpu ? 'gpu' : 'cpu';
   let s = null;
   if (device === 'gpu') { try { s = await createSessions(m, 'gpu'); } catch (e) { device = 'cpu'; } }
   if (!s) s = await createSessions(m, 'cpu');

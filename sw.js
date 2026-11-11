@@ -1,8 +1,8 @@
 /* Clearcut offline support. The app shell and runtime come from this cache.
    Model weights are stored by the app itself in IndexedDB, so this worker
    passes those large chunk downloads straight to the network. */
-const VERSION = 'clearcut-6d1111b6cf0f';
-const SHELL = ["./", "index.html", "worker.js", "describe-worker.js", "manifest.webmanifest", "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png", "icons/favicon-64.png", "vendor/ort/ort.webgpu.min.js", "vendor/ort/ort-wasm-simd-threaded.jsep.js", "m/manifest.json", "m/graph.bin", "m/rt.bin", "m/s-enc-graph.bin", "m/s-dec-graph.bin", "m/f-graph.bin"];
+const VERSION = 'clearcut-1c81d1cc5595';
+const SHELL = ["./", "index.html", "worker.js", "describe-worker.js", "manifest.webmanifest", "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png", "icons/favicon-64.png", "vendor/ort/ort.webgpu.min.js", "vendor/ort/ort-wasm-simd-threaded.jsep.js", "vendor/ort/ort.wasm.min.js", "vendor/ort/ort-wasm-simd-threaded.js", "m/manifest.json", "m/graph.bin", "m/rt.bin", "m/rt-cpu.bin", "m/s-enc-graph.bin", "m/s-dec-graph.bin", "m/f-graph.bin"];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(VERSION).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));

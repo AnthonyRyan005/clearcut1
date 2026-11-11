@@ -10,6 +10,7 @@ const MEAN = [0.485, 0.456, 0.406];
 const STD = [0.229, 0.224, 0.225];
 
 let ortReady = false;
+let plainOrt = false;   // ONNX Runtime's plain processor build (Safari), see loadOrt
 let main = null;        // { session, device, graph, pack, man, weights }
 let sam = null;         // { enc, dec, encDevice, encGraph, encPack, encMan }
 let img = null;         // per-photo state, see storeImage()
@@ -63,28 +64,31 @@ function buildWeights(packBuf, man) {
   }
   return u8;
 }
-async function loadOrt(runtimeBlob) {
+/* plain: load ONNX Runtime's processor-only build. Safari 26 needs gigabytes of
+   memory to compile the graphics-chip build, which crashes iPhones and iPads. */
+async function loadOrt(runtimeBlob, plain) {
   if (ortReady) return;
+  plainOrt = !!plain;
   let lastErr = null;
   for (const base of ORT_SOURCES) {
-    try { importScripts(base + 'ort.webgpu.min.js'); ORT_BASE = base; ortReady = true; break; }
+    try { importScripts(base + (plainOrt ? 'ort.wasm.min.js' : 'ort.webgpu.min.js')); ORT_BASE = base; ortReady = true; break; }
     catch (e) { lastErr = e; }
   }
   if (!ortReady) throw new Error('Could not load the model runtime (' + (lastErr && lastErr.message ? lastErr.message : 'network error') + ').');
   ort.env.wasm.numThreads = 1;
   ort.env.wasm.proxy = false;
   // Self-hosted copies ship the runtime glue as .js, because some static hosts serve .mjs with a non-script type.
-  ort.env.wasm.wasmPaths = ORT_BASE === ORT_LOCAL ? { mjs: ORT_LOCAL + 'ort-wasm-simd-threaded.jsep.js' } : ORT_BASE;
+  ort.env.wasm.wasmPaths = ORT_BASE === ORT_LOCAL ? { mjs: ORT_LOCAL + (plainOrt ? 'ort-wasm-simd-threaded.js' : 'ort-wasm-simd-threaded.jsep.js') } : ORT_BASE;
   ort.env.wasm.wasmBinary = await gunzip(runtimeBlob);
   ort.env.logLevel = 'error';
   if (ort.env.webgpu) ort.env.webgpu.powerPreference = 'high-performance';
 }
 async function makeSession(graph, weights, dev) {
-  return ort.InferenceSession.create(graph, {
-    executionProviders: [dev === 'gpu' ? 'webgpu' : 'wasm'],
+  return ort.InferenceSession.create(graph, Object.assign({
+    executionProviders: [dev === 'gpu' && !plainOrt ? 'webgpu' : 'wasm'],
     graphOptimizationLevel: 'all',
     externalData: [{ path: 'weights.bin', data: weights }],
-  });
+  }));
 }
 
 /* ---------- resampling ---------- */
@@ -1013,7 +1017,7 @@ async function runMain(input, id) {
 const handlers = {
   async init(m) {
     progress(m.id, { step: 'unpack' });
-    await loadOrt(m.runtime);
+    await loadOrt(m.runtime, m.plain);
     const graph = new Uint8Array(await gunzip(m.graph));
     main = { session: null, device: null, graph, pack: m.pack, man: m.manifest, weights: buildWeights(await gunzip(m.pack), m.manifest) };
     progress(m.id, { step: 'start' });
@@ -1023,7 +1027,9 @@ const handlers = {
       catch (e) { note = 'gpu-failed: ' + (e && e.message ? e.message : e); dev = 'cpu'; }
     }
     if (dev === 'cpu') { main.session = await makeSession(graph, main.weights, 'cpu'); main.device = 'cpu'; }
-    return [{ device: main.device, note }];
+    // The session keeps its own copy. If the graphics chip fails later, runMain rebuilds them from the pack.
+    main.weights = null;
+    return [{ device: main.device, note, plain: plainOrt }];
   },
 
   async cutout(m) {
@@ -1039,7 +1045,8 @@ const handlers = {
     storeImage(rgba, m.w, m.h, mask, alpha);
     const cut = finishCutout(rgba, m.w, m.h, alpha);
     const t2 = performance.now();
-    return [{ cut: cut.buffer, rgba: rgba.buffer, device: main.device, ms: { model: t1 - t0, refine: t2 - t1 } }, [cut.buffer, rgba.buffer]];
+    const maskCopy = mask.slice();   // lets the page restore this state in a fresh worker
+    return [{ cut: cut.buffer, rgba: rgba.buffer, mask: maskCopy.buffer, device: main.device, ms: { model: t1 - t0, refine: t2 - t1 } }, [cut.buffer, rgba.buffer, maskCopy.buffer]];
   },
 
   /* Example photo: the model mask ships with the page. */
@@ -1054,7 +1061,7 @@ const handlers = {
 
   async samInit(m) {
     if (sam) return [{ device: sam.encDevice }];
-    await loadOrt(m.runtime);
+    await loadOrt(m.runtime, m.plain);
     const encGraph = new Uint8Array(await gunzip(m.enc.graph));
     const decGraph = new Uint8Array(await gunzip(m.dec.graph));
     const decWeights = buildWeights(await gunzip(m.dec.pack), m.dec.man);
@@ -1095,7 +1102,7 @@ const handlers = {
   async fillInit(m) {
     const kind = m.kind || 'migan';
     if (fills[kind]) return [{ device: fills[kind].device }];
-    await loadOrt(m.runtime);
+    await loadOrt(m.runtime, m.plain);
     const graph = new Uint8Array(await gunzip(m.graph));
     const weights = buildWeights(await gunzip(m.pack), m.man);
     let session = null, device = m.device;
