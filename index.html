@@ -580,12 +580,12 @@ a.btn { text-decoration: none; }
           <button type="button" data-kind="sticker" aria-pressed="false">Sticker</button>
         </div>
         <div class="saverow">
-          <div class="seg" role="group" aria-label="File format">
+          <div class="seg" id="fmtSeg" role="group" aria-label="File format">
             <button type="button" data-format="png" aria-pressed="true">PNG</button>
             <button type="button" data-format="jpg" aria-pressed="false">JPG</button>
           </div>
           <label class="check" id="trimLabel"><input type="checkbox" id="trim"> Trim to subject</label>
-          <label class="check" id="outlineLabel" hidden><input type="checkbox" id="outline" checked> White outline</label>
+          <label class="check" id="outlineLabel" hidden><input type="checkbox" id="outline"> White outline</label>
         </div>
         <p class="hint" id="formatHint">PNG keeps the transparent background.</p>
         <div class="saverow">
@@ -656,7 +656,7 @@ const S = {
   stageW: 0, stageH: 0,
   busy: false, scanStart: 0,
   history: [], future: [], historyBytes: 0,
-  format: 'png', trim: false, sticker: false, outline: true,
+  format: 'png', trim: false, sticker: false, outline: false,
   objects: [], objSeq: 0, composing: false, composeAgain: false, embedded: false,
   crop: null, draft: null, ratio: 'free', ratioTurned: false,
   timing: null, cutBusy: false,
@@ -2708,6 +2708,8 @@ function stickerImage() {
       out[p + 3] = A * 255;
     }
   }
+  // Fully see-through pixels carry no colour, so nothing of the old background stays in the file.
+  for (let p = 3; p < out.length; p += 4) if (out[p] === 0) { out[p - 3] = 0; out[p - 2] = 0; out[p - 1] = 0; }
   const canvas = makeCanvas(w, h);
   canvas.getContext('2d').putImageData(new ImageData(out, w, h), 0, 0);
   const st = { rgba: out, canvas, w, h, x: box.x - m, y: box.y - m };
@@ -2716,20 +2718,14 @@ function stickerImage() {
 }
 /* The sticker preview replaces the result view while no brush is in use. */
 const stickerView = () => S.sticker && !!S.cut && !BRUSH_TOOLS[S.tool] && S.tool !== 'remove' && S.tool !== 'pick';
-/* JPG can't be see-through: a sticker JPG sits on the chosen colour, or white. */
-const stickerJpgColour = () => (S.bg === 'custom' ? S.bgColor : /^#/.test(S.bg) ? S.bg : '#ffffff');
-async function stickerBlob(fmt) {
+/* Stickers are PNG only. JPG has no see-through pixels, so it can't hold a shape. */
+const outFormat = () => (S.sticker ? 'png' : S.format);
+async function stickerBlob() {
   const st = stickerImage();
-  if (fmt === 'png') {
-    const buf = st.rgba.slice().buffer;
-    const res = await rpc('png', { rgba: buf, w: st.w, h: st.h, crop: { x: 0, y: 0, w: st.w, h: st.h } }, [buf]);
-    if (!res.blob) throw new Error(res.error || 'PNG encoding failed');
-    return { blob: res.blob, crop: { x: st.x, y: st.y, w: st.w, h: st.h } };
-  }
-  const c = makeCanvas(st.w, st.h), x = c.getContext('2d');
-  x.fillStyle = stickerJpgColour(); x.fillRect(0, 0, st.w, st.h);
-  x.drawImage(st.canvas, 0, 0);
-  return { blob: await toBlob(c, 'image/jpeg', 0.92), crop: { x: st.x, y: st.y, w: st.w, h: st.h } };
+  const buf = st.rgba.slice().buffer;
+  const res = await rpc('png', { rgba: buf, w: st.w, h: st.h, crop: { x: 0, y: 0, w: st.w, h: st.h } }, [buf]);
+  if (!res.blob) throw new Error(res.error || 'PNG encoding failed');
+  return { blob: res.blob, crop: { x: st.x, y: st.y, w: st.w, h: st.h } };
 }
 
 /* ---------- export ---------- */
@@ -2754,7 +2750,7 @@ function cropBox() {
 }
 function toBlob(c, type, q) { return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('Encoding failed'))), type, q)); }
 async function exportBlob(fmt) {
-  if (S.sticker) return stickerBlob(fmt);
+  if (S.sticker) return stickerBlob();
   const crop = cropBox();
   if (S.bg === 'transparent' && fmt === 'png') {
     const buf = S.cut.data.buffer;
@@ -2788,7 +2784,7 @@ async function save() {
   if (!S.cut || S.busy || saving || S.composing || S.removing) return;
   if (S.tool === 'crop') setTool('move');
   saving = true; updateUI();
-  const fmt = S.format;
+  const fmt = outFormat();
   const btn = $('saveBtn');
   btn.textContent = 'Preparing…';
   try {
@@ -2824,9 +2820,11 @@ function showSaveSheet(blob, filename) {
   if (STANDALONE) {
     const canShare = !!(navigator.canShare && navigator.canShare({ files: [sheetFile] }));
     $('saveTitle').textContent = S.sticker ? 'Your sticker is ready' : S.bg === 'photo' ? 'Your photo is ready' : 'Your cutout is ready';
-    $('saveHelp').textContent = canShare
-      ? 'Tap Save or share, then choose Save Image to add it to Photos, or Save to Files.'
-      : 'Use Download to save the file. You can also press and hold the image.';
+    $('saveHelp').textContent = !canShare
+      ? 'Use Download to save the file. You can also press and hold the image.'
+      : S.sticker
+      ? 'Tap Save or share, then Save to Files to keep only the shape. Photos can show the empty area as white. For a Messages sticker, choose Save Image instead, then in Photos touch and hold the subject and tap Add Sticker.'
+      : 'Tap Save or share, then choose Save Image to add it to Photos, or Save to Files.';
     $('saveShare').hidden = !canShare;
     $('saveDownload').hidden = false;
     $('saveDownload').href = sheetUrl;
@@ -2875,7 +2873,7 @@ function updateUI() {
   const ready = !!S.cut && !S.busy;
   $('saveBtn').disabled = !ready || saving || S.composing || S.removing;
   $('copyBtn').disabled = !ready || saving || S.composing || S.removing;
-  if (!saving) $('saveBtn').textContent = (S.sticker ? 'Save sticker ' : 'Save ') + (S.format === 'jpg' ? 'JPG' : 'PNG');
+  if (!saving) $('saveBtn').textContent = (S.sticker ? 'Save sticker ' : 'Save ') + (outFormat() === 'jpg' ? 'JPG' : 'PNG');
   $('undoBtn').disabled = !ready || !S.history.length || S.composing || S.removing;
   $('redoBtn').disabled = !ready || !S.future.length || S.composing || S.removing;
   $('resetBtn').disabled = !ready || !hasTouchUps() || S.composing || S.removing;
@@ -2899,9 +2897,7 @@ function updateUI() {
   const names = { transparent: 'Transparent', photo: 'Photo', '#ffffff': 'White', '#111111': 'Black', '#e8e2d6': 'Stone', custom: S.bgColor.toUpperCase(), blur: 'Blurred original' };
   $('bgName').textContent = names[S.bg] || S.bg;
   $('formatHint').textContent = S.sticker
-    ? (S.format === 'jpg'
-      ? `Only the subject, trimmed to its edges. JPG can't be see-through, so the corners are ${stickerJpgColour() === '#ffffff' ? 'white' : 'your background colour'}. Choose PNG for nothing around it.`
-      : 'Only the subject, trimmed to its edges, with nothing around it. On iPhone or iPad, save it to Photos, open it, touch and hold the subject, then tap Add Sticker.')
+    ? "Saves just the subject's shape as a see-through PNG. Stickers are PNG only because JPG can't be see-through. Many viewers show the empty area as white. Place it on a message, slide or design and only the shape shows."
     : S.format === 'jpg'
     ? (S.bg === 'transparent' ? 'JPG has no transparency, so the background is saved as white.' : 'JPG files are smaller. The background is saved as shown.')
     : (S.bg === 'transparent' ? 'PNG keeps the transparent background.' : S.bg === 'photo' ? 'PNG of the whole photo, with your edits.' : 'PNG with the background shown.');
@@ -3005,6 +3001,7 @@ function setSticker(on) {
   S.sticker = !!on;
   for (const b of document.querySelectorAll('[data-kind]')) b.setAttribute('aria-pressed', String((b.dataset.kind === 'sticker') === S.sticker));
   $('trimLabel').hidden = S.sticker;
+  $('fmtSeg').hidden = S.sticker;
   $('outlineLabel').hidden = !S.sticker;
   try { localStorage.setItem('clearcut.sticker', S.sticker ? '1' : '0'); } catch (e) { /* private mode */ }
   if (S.sticker && S.mode === 'mask') setMode('result');
@@ -3013,11 +3010,12 @@ function setSticker(on) {
 for (const b of document.querySelectorAll('[data-kind]')) b.addEventListener('click', () => setSticker(b.dataset.kind === 'sticker'));
 $('outline').addEventListener('change', (e) => {
   S.outline = e.target.checked;
-  try { localStorage.setItem('clearcut.outline', S.outline ? '1' : '0'); } catch (err) { /* private mode */ }
+  try { localStorage.setItem('clearcut.border', S.outline ? '1' : '0'); } catch (err) { /* private mode */ }
   updateUI(); schedule();
 });
 try {
-  S.outline = localStorage.getItem('clearcut.outline') !== '0';
+  // The outline adds white around the shape, so it stays off unless you turn it on.
+  S.outline = localStorage.getItem('clearcut.border') === '1';
   $('outline').checked = S.outline;
   if (localStorage.getItem('clearcut.sticker') === '1') setSticker(true);
 } catch (e) { /* private mode */ }
