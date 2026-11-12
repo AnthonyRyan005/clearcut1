@@ -21,6 +21,7 @@ const TASKS = {
 /* Longest prompt per style, in words. People get a little more room for pose and expression. */
 const MAX_WORDS = { prompt: 120, detailed: 230, short: 40 };
 const PEOPLE_WORDS = { prompt: 145, detailed: 250, short: 40 };
+const DETAIL_WORDS = 40;   // more room still when explicit adult details are added
 
 let rt = null, model = null, stopRequested = false, plainOrt = false;
 const post = (m) => self.postMessage(m);
@@ -271,13 +272,29 @@ const JUNK = [
   /\bwatermark|\bjpe?g artifact|\bsignature\b|\blogo in the (bottom|top)/i,
   /\b(is|are) not (specified|visible|clear)\b|\bno other (elements|objects|details)\b/i,
   /\bno (pants|shoes|humans|accessor\w*)\b/i,
-  // The model learned from tagged artwork and sometimes adds body or sexual details that aren't there.
-  /\b(breasts?|cleavage|nsfw|uncensored|sexy|seductive|nude|naked|nudity|nipples?|topless|lingerie|panties|underwear|crotch|groin|saliva|drool\w*|curves|curvy|voluptuous)\b/i,
   /^the image (is|has) (of )?(a )?(high[- ]quality|high resolution|good quality)/i,
   /^the image (has|is) (a )?(simple|clean|minimalist)\b/i,
   /^(the )?overall,? (the )?(mood|atmosphere|aesthetic|image)\b/i,
   /\bgiving (it|the image) a (sense of depth|three-dimensional)/i,
 ];
+/* Body and sexual details. Kept when the picture clearly shows adults only, so
+   the prompt describes what is there. Removed whenever a child or teenager may
+   be in the picture: the model learned from tagged artwork and sometimes adds
+   such details wrongly, even to a photo of a baby. */
+const BODY = /\b(breasts?|cleavage|nsfw|uncensored|sexy|seductive|erotic|nude|naked|nudity|nipples?|topless|bottomless|lingerie|panties|underwear|bra|crotch|groin|genital\w*|buttocks|saliva|drool\w*|curves|curvy|voluptuous)\b/i;
+// Anything that could mean a child or teenager, including words that are
+// sometimes used for adults ("girl", "petite", "school"): with any doubt, the
+// explicit details go.
+const MINOR = /\b(child|children|childlike|kids?|bab(y|ies)|toddlers?|infants?|newborns?|teens?|teenagers?|teenage|adolescents?|minors?|underage|schoolgirls?|schoolboys?|pre-?teens?|girls?|boys?|daughters?|sons?|students?|pupils?|youth|juvenile|little|petite|loli\w*|shota\w*|kindergarten|elementary|school|barely legal|jailbait|flat[- ]chest(ed)?)\b|\b([1-9]|1[0-7])[- ](years?|yrs?|months?)[- ]old\b|\b(early|late|mid)[- ]?teens\b/i;
+const MINOR_TAG = /\b(child|children|kid|baby|toddler|loli|shota|aged down|teen|teenage|young|petite|flat chest|school|kindergarten|elementary|randoseru|serafuku|student)\b/;
+const ADULT = /\b(wom[ae]n|m[ae]n|adults?|lad(y|ies)|gentlem[ae]n|husband|wife|bride|groom|mother|father)\b|\b(1[89]|[2-9]\d)[- ](years?|yrs?)[- ]old\b|\b(twenties|thirties|forties|fifties|sixties|seventies|eighties|[2-8]0s)\b/i;
+/* True only when everything written about the picture points to adults and
+   nothing points to a child or teenager. "1girl" and "1boy" are tag habits for
+   anyone, so they don't count either way; "girl" and "boy" as words do. */
+function adultsOnly(texts, tags) {
+  const t = texts.filter(Boolean).join(' ');
+  return ADULT.test(t) && !MINOR.test(t) && !tags.some((x) => MINOR_TAG.test(x));
+}
 const FIX = [
   [/\bsleeveled\b/gi, 'sleeveless'], [/\b(\d+) years old (wo)?man\b/gi, '$1-year-old $2man'],
   [/\ban? (\d+) years? old,? (?:1 ?)?(girl|boy)\b/gi, 'a $1-year-old $2'],
@@ -291,7 +308,7 @@ const FIX = [
 // "on a plain white background" and the like, removed when the background is described separately
 const BG_PHRASE = /\s*,?\s*\b(in|on|with|against|set against|over) (a |an |the )?(plain|simple|solid|clean|blank|pure)?\s*(white|black|grey|gray|light|dark|neutral|colou?red|\w+)?\s*(background|backdrop)\b/gi;
 const BACKGROUND = /\b(background|backdrop|setting|scenery|landscape|in the distance|horizon)\b|^the sky\b/i;
-function sentences(text) {
+function sentences(text, adults = false) {
   let t = text.replace(/\s+/g, ' ').trim();
   for (const [a, b] of FIX) t = t.replace(a, b);
   const parts = t.split(/(?<=[.!?])\s+/).map((p) => p.trim()).filter(Boolean).map((p) => {
@@ -306,7 +323,7 @@ function sentences(text) {
     p = p.replace(/^the image also shows\s+/i, '');
     return cap(p.replace(/\s+\./g, '.'));
   });
-  return parts.filter((p) => p.length > 3 && !JUNK.some((re) => re.test(p)));
+  return parts.filter((p) => p.length > 3 && !JUNK.some((re) => re.test(p)) && (adults || !BODY.test(p)));
 }
 const jac = (a, b) => {
   const A = new Set(words(a)), B = new Set(words(b));
@@ -416,11 +433,11 @@ function tidy(p) {
    it about nearly everyone; so is a "neutral expression" when the tags see a
    smile or a frown. With several people the tags mix up who does what, so then
    only the caption is used. */
-function peopleNotes(parsed) {
+function peopleNotes(parsed, adults = false) {
   const { tags, notes } = parsed;
   const isPeople = PERSON.test(parsed.caption) || tags.some((t) => PERSON_TAG.test(t) || MANY.test(t));
   if (!isPeople) return { caption: parsed.caption, sentence: '', people: false };
-  let sens = sentences(parsed.caption);
+  let sens = sentences(parsed.caption, adults);
   const tagSet = new Set(tags);
   const many = tags.some((t) => MANY.test(t)) || GROUP.test(sens[0] || '');
   if (tags.length && !tagSet.has('looking at viewer') && !tagSet.has('eye contact')) sens = sens.map((p) => tidy(p.replace(GAZE_AT_VIEWER, '')));
@@ -436,7 +453,7 @@ function peopleNotes(parsed) {
     return have(new RegExp('\\b' + stem)) && (w.length < 2 || have(new RegExp('\\b' + noun)));
   };
   let out = [];
-  const push = (p) => { if (p && !out.includes(p) && !JUNK.some((re) => re.test(p))) out.push(p); };
+  const push = (p) => { if (p && !out.includes(p) && !JUNK.some((re) => re.test(p)) && !BODY.test(p)) out.push(p); };
   for (const a of notes.action || []) if (a.length < 40 && /^[a-z ,'-]+$/.test(a) && !said(a)) push(a);
   for (const f of notes.facing_direction || []) {
     const p = /away/.test(f) ? 'facing away' : /viewer|camera|front|forward/.test(f) ? 'facing the camera' : /left|right|side/.test(f) ? 'turned to the side' : '';
@@ -462,6 +479,23 @@ function peopleNotes(parsed) {
 }
 /* Sentences about how people hold themselves, move, look, feel or what they're about to do. */
 const PEOPLE_CUE = /\b(smil\w*|laugh\w*|grin\w*|express\w*|emotion\w*|happ\w*|sad|angry|serious|focus\w*|determin\w*|calm|relax\w*|excit\w*|surpris\w*|joy\w*|frown\w*|look(s|ing)?( directly| straight)? (at|into|away|down|up|back|to|over)|gaz\w*|facing|posture|pos(e|es|ed|ing)|stand\w*|sitting|seated|crouch\w*|kneel\w*|lean\w*|bend\w*|bent|walk\w*|run\w*|jump\w*|swing\w*|catch\w*|throw\w*|reach\w*|point\w*|wav\w*|danc\w*|ready to|about to|as if|trying to|preparing to|in mid-?air|motion|moving|gestur\w*|outstretched|raised)\b/i;
+/* Explicit pictures of adults: the model's own tags add detail its caption
+   leaves out. Only used when the caption itself describes nudity or sex,
+   because on other pictures these tags are often wrong. Leaves out tags about
+   the picture rather than its content, pose tags (used above) and tags the
+   caption already says. */
+const EXPLICIT = /\b(nude|naked|nudity|topless|bottomless|explicit|sex|sexual|erotic|nipples?|genital\w*)\b/i;
+const META_TAG = /^(solo|\d+(girls?|boys?|others?)|multiple (girls|boys|others)|(male|female) focus|realistic|photorealistic|photo \(medium\)|photograph|blurry( background| foreground)?|depth of field|(simple|white|grey|gray|black|transparent|gradient) background|highres|absurdres|lowres|jpeg artifacts|watermark|signature|web address|artist name|.*\btext\b.*|.*out of frame|cropped.*)$/;
+function detailTags(tags, said) {
+  const lower = said.toLowerCase(), out = [];
+  for (const t of tags) {
+    if (!t || META_TAG.test(t) || POSE_TAGS.some((e) => e[0] === t) || out.includes(t)) continue;
+    if (t.split(/\s+/).every((w) => lower.includes(w))) continue;
+    out.push(t);
+    if (out.length >= 20) break;
+  }
+  return out.length ? `Details: ${out.join(', ')}.` : '';
+}
 /* Keep to the word limit by dropping sentences from the end, those that don't satisfy keep first. */
 function capKeep(parts, max, keep) {
   const n = (p) => p.split(/\s+/).length, out = parts.slice();
@@ -476,15 +510,15 @@ function capKeep(parts, max, keep) {
    people: a sentence on pose and expression, or '', and whether there are people
    at all. With people, sentences about pose, movement and expression are the
    last to go when the prompt is too long. */
-function merge(scene, subject, plain, maxWords, people = '', hasPeople = !!people) {
-  const sub = sentences(subject);
+function merge(scene, subject, plain, maxWords, people = '', hasPeople = !!people, adults = false) {
+  const sub = sentences(subject, adults);
   const fit = hasPeople ? (parts, max) => capKeep(parts, max, (p) => p === people || PEOPLE_CUE.test(p)) : capWords;
   const out = [];
   // The pose sentence goes after the subject's details, before the setting.
   const place = (n) => { if (people) out.splice(n, 0, people); };
   if (scene) {
     // The whole picture leads, the close-up adds details of the subject, then the rest of the scene.
-    const sc = sentences(scene);
+    const sc = sentences(scene, adults);
     if (sc[0]) out.push(sc[0]);
     for (const p of sub.slice(sc[0] ? 1 : 0)) if (!BACKGROUND.test(p) && adds(out, p, 3)) out.push(p);
     const n = out.length;
@@ -563,15 +597,23 @@ async function describe(m) {
     got[v.role] = r.text; encMs += r.encMs; tokens += r.tokens;
   }
   let text, people = '';
-  if (got.short !== undefined) text = capWords(sentences(got.short), maxWords).join(' ');
+  if (got.short !== undefined) text = capWords(sentences(got.short, adultsOnly([got.short], [])), maxWords).join(' ');
   else {
     let subject = got.subject;
     let hasPeople = false;
-    if (subject !== undefined) {
-      const notes = peopleNotes(parseMixed(subject));
+    const parsed = subject !== undefined ? parseMixed(subject) : null;
+    const adults = adultsOnly([got.subject, got.scene], parsed ? parsed.tags : []);
+    let words = maxWords;
+    if (parsed) {
+      const notes = peopleNotes(parsed, adults);
       subject = notes.caption; people = notes.sentence; hasPeople = notes.people;
+      if (hasPeople) words = PEOPLE_WORDS[m.style] || maxWords;
+      if (adults && EXPLICIT.test(parsed.caption + ' ' + (got.scene || ''))) {
+        const extra = detailTags(parsed.tags, [parsed.caption, got.scene, people].filter(Boolean).join(' '));
+        if (extra) { people = people ? `${people} ${extra}` : extra; hasPeople = true; words += DETAIL_WORDS; }
+      }
     }
-    text = merge(got.scene || null, subject || got.scene || '', m.plain || null, hasPeople ? (PEOPLE_WORDS[m.style] || maxWords) : maxWords, people, hasPeople);
+    text = merge(got.scene || null, subject || got.scene || '', m.plain || null, words, people, hasPeople, adults);
   }
   return { text, ms: performance.now() - t0, encMs, tokens, people: !!people };
 }

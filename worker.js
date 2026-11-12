@@ -596,6 +596,7 @@ function compose(objs) {
 
 /* ---------- object removal: MI-GAN fills the gap ---------- */
 const FILL = 512;       // both fill models work on 512 x 512 windows
+const FILL_HI = 1024;   // LaMa also runs at 1024 x 1024 for large areas, when asked (sharper, about 4 times slower)
 /* Fill models by kind: 'lama' (Big-LaMa, best) and 'migan' (MI-GAN, fast).
    Each is { session, device, graph, pack, man, inName, outName }. */
 const fills = {};
@@ -697,17 +698,42 @@ function writeRect(dst, W, ch, x0, y0, w, h, data) {
   for (let y = 0; y < h; y++) dst.set(data.subarray(y * w * ch, (y + 1) * w * ch), ((y0 + y) * W + x0) * ch);
 }
 
-async function runFill(kind, input) {
+/* The session that runs a fill model at size D. LaMa at 1024 has its own graph
+   on the same weights. On iPad and iPhone only one LaMa session is kept, so
+   switching size releases the other one first: each holds about 200 MB. */
+async function fillSession(kind, D) {
   const fill = fills[kind];
-  const tensor = new ort.Tensor('float32', input, [1, 4, FILL, FILL]);
+  const hi = D === FILL_HI, key = hi ? 'sessionHi' : 'session';
+  if (fill[key]) return fill[key];
+  const other = hi ? 'session' : 'sessionHi';
+  if (fill.lowMem && fill[other]) {
+    try { await fill[other].release(); } catch (e) { /* ignore */ }
+    fill[other] = null;
+  }
+  const weights = buildWeights(await gunzip(fill.pack), fill.man);
+  const graph = hi ? fill.graphHi : fill.graph;
+  let session = null;
+  if (fill.device === 'gpu') {
+    try { session = await makeSession(graph, weights, 'gpu'); } catch (e) { fill.device = 'cpu'; }
+  }
+  if (!session) session = await makeSession(graph, weights, 'cpu');
+  fill[key] = session;
+  return session;
+}
+async function runFill(kind, input, D = FILL) {
+  const fill = fills[kind];
+  const key = D === FILL_HI ? 'sessionHi' : 'session';
+  const tensor = new ort.Tensor('float32', input, [1, 4, D, D]);
   let res;
-  try { res = await fill.session.run({ [fill.inName]: tensor }); }
+  try { res = await (await fillSession(kind, D)).run({ [fill.inName]: tensor }); }
   catch (e) {
     if (fill.device !== 'gpu') throw e;
-    try { await fill.session.release(); } catch (err) { /* ignore */ }
-    fill.session = await makeSession(fill.graph, buildWeights(await gunzip(fill.pack), fill.man), 'cpu');
+    // The graphics chip failed (often out of memory): run on the processor from now on.
+    for (const k of ['session', 'sessionHi']) {
+      if (fill[k]) { try { await fill[k].release(); } catch (err) { /* ignore */ } fill[k] = null; }
+    }
     fill.device = 'cpu';
-    res = await fill.session.run({ [fill.inName]: tensor });
+    res = await (await fillSession(kind, D)).run({ [fill.inName]: tensor });
   }
   const t = res[fill.outName];
   const out = new Float32Array(t.data);
@@ -768,9 +794,10 @@ async function removalArea(x, y, id) {
 }
 
 /* Fill the masked area of the photo. The model sees a square-ish window with
-   plenty of context, resampled to 512 x 512. Its result is blended back with a
-   soft edge that sits just inside the masked area. */
-async function fillArea(rect, src, kind, detail = true) {
+   plenty of context, resampled to 512 x 512, or to 1024 x 1024 with hi (LaMa
+   only) when the window is large enough to gain from it. Its result is blended
+   back with a soft edge that sits just inside the masked area. */
+async function fillArea(rect, src, kind, detail = true, hi = false) {
   const W = img.w, H = img.h;
   let bx0 = W, by0 = H, bx1 = -1, by1 = -1;
   for (let y = 0; y < rect.h; y++) for (let x = 0; x < rect.w; x++) {
@@ -784,7 +811,14 @@ async function fillArea(rect, src, kind, detail = true) {
   const side = Math.max(FILL, big + 2 * Math.max(128, Math.round(0.3 * big)));
   const ww = Math.min(side, W), wh = Math.min(side, H);
   const wx = Math.round(clampN((bx0 + bx1 + 1) / 2 - ww / 2, 0, W - ww)), wy = Math.round(clampN((by0 + by1 + 1) / 2 - wh / 2, 0, H - wh));
-  const scale = Math.max(ww, wh) / FILL;
+  // At 1024 the model sees the window at twice the detail. That helps when the
+  // gap is narrow enough there, such as a person: LaMa learned on small images,
+  // and at 1024 a wide gap (more than about 110 px from the photo at its middle)
+  // comes out blotchy and grid-patterned instead. Not worth four times the work
+  // when the window is only a little larger than 512 either.
+  const D = hi && kind === 'lama' && fills.lama.graphHi && Math.max(ww, wh) >= 1.5 * FILL &&
+    inradius(src, rect.w, rect.h) / (Math.max(ww, wh) / FILL_HI) <= 110 ? FILL_HI : FILL;
+  const scale = Math.max(ww, wh) / D;
   const fw = Math.max(2, Math.round(1.5 * Math.max(1, scale)));
   const gx0 = Math.max(wx, bx0 - fw - 1), gy0 = Math.max(wy, by0 - fw - 1);
   const gx1 = Math.min(wx + ww, bx1 + fw + 2), gy1 = Math.min(wy + wh, by1 + fw + 2);
@@ -812,10 +846,10 @@ async function fillArea(rect, src, kind, detail = true) {
   // LaMa input: the photo (0..1) with the gap blanked, then the gap as 1.
   const winHole = new Uint8Array(ww * wh);
   for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) if (grown[y * gw + x]) winHole[(gy0 - wy + y) * ww + (gx0 - wx + x)] = 1;
-  const planes = resampleRGBA(img.rgba, W, wx, wy, ww, wh, FILL);
-  const cov = resampleMask(winHole, ww, wh, FILL);
-  if (subjectAware) hideNearbySubject(cov, wx, wy, ww, wh, W);
-  const P = FILL * FILL, inp = new Float32Array(4 * P);
+  const planes = resampleRGBA(img.rgba, W, wx, wy, ww, wh, D);
+  const cov = resampleMask(winHole, ww, wh, D);
+  if (subjectAware) hideNearbySubject(cov, wx, wy, ww, wh, W, D);
+  const P = D * D, inp = new Float32Array(4 * P);
   for (let i = 0; i < P; i++) {
     const known = cov[i] > 0.01 ? 0 : 1;
     if (kind === 'lama') {
@@ -829,21 +863,21 @@ async function fillArea(rect, src, kind, detail = true) {
     }
   }
   const t0 = performance.now();
-  const out = await runFill(kind, inp);
+  const out = await runFill(kind, inp, D);
   const ms = performance.now() - t0;
-  if (seamOn) seamless(out, planes, cov, FILL);
+  if (seamOn) seamless(out, planes, cov, D);
   if (typeof fillDebug === 'object') Object.assign(fillDebug, { planes, cov, out: out.slice(), scale, win: { x: wx, y: wy, w: ww, h: wh } });   // test harness only
   const before = copyRect(img.rgba, W, 4, gx0, gy0, gw, gh);
   const alphaBefore = copyRect(img.alpha, W, 1, gx0, gy0, gw, gh);
   // Upscale the result to the window, but only where it lands in the gap.
-  const kx = kernel(FILL, ww), ky = kernel(FILL, wh);
-  const tmp = new Float32Array(FILL * gw * 3);
-  for (let r = 0; r < FILL; r++) {
+  const kx = kernel(D, ww), ky = kernel(D, wh);
+  const tmp = new Float32Array(D * gw * 3);
+  for (let r = 0; r < D; r++) {
     for (let xi = 0; xi < gw; xi++) {
       const x = gx0 - wx + xi, st = kx.start[x], n = kx.count[x], b = x * kx.taps;
       let cr = 0, cg = 0, cb = 0;
       for (let k = 0; k < n; k++) {
-        const q = r * FILL + st + k, wt = kx.w[b + k];
+        const q = r * D + st + k, wt = kx.w[b + k];
         cr += out[q] * wt; cg += out[P + q] * wt; cb += out[2 * P + q] * wt;
       }
       const o = (r * gw + xi) * 3;
@@ -875,10 +909,25 @@ async function fillArea(rect, src, kind, detail = true) {
   return {
     rect: { x: gx0, y: gy0, w: gw, h: gh }, wgt, before, alphaBefore,
     after: copyRect(rgba, W, 4, gx0, gy0, gw, gh), alphaAfter: copyRect(alpha, W, 1, gx0, gy0, gw, gh),
-    ms, scale, detailMs,
+    ms, scale, detailMs, size: D,
   };
 }
 function clampN(v, a, b) { return v < a ? a : (v > b ? b : v); }
+/* How far the middle of a gap is from the photo around it, in pixels: the
+   largest distance from a gap pixel to the nearest pixel outside the gap.
+   Worked out on a grid of at most about 512 x 512, which is close enough. */
+function inradius(m, w, h) {
+  const st = Math.max(1, Math.ceil(Math.max(w, h) / 512));
+  const cw = Math.ceil(w / st) + 2, ch = Math.ceil(h / st) + 2, c = new Uint8Array(cw * ch);
+  for (let y = 0; y < ch - 2; y++) for (let x = 0; x < cw - 2; x++) {
+    const sy = Math.min(h - 1, y * st), sx = Math.min(w - 1, x * st);
+    c[(y + 1) * cw + x + 1] = m[sy * w + sx] ? 1 : 0;
+  }
+  const d = chamfer(c, cw, ch, 0);
+  let mx = 0;
+  for (let i = 0; i < d.length; i++) if (d[i] > mx) mx = d[i];
+  return mx * st;
+}
 
 /* Remove without a fill: the area becomes transparent, in the photo and in the
    cutout. A soft edge about a pixel and a half wide sits just inside it. */
@@ -965,9 +1014,9 @@ let subjectAware = true;   // tests can turn this off for comparisons
    found by closing the subject's shape across the gap: a narrow part of the
    gap with subject on both sides closes up. The subject next to them stays
    visible, so the model continues it there.
-   Works on the model's 512 x 512 gap coverage, in place. */
-function hideNearbySubject(cov, wx, wy, ww, wh, W) {
-  const D = FILL, P = D * D;
+   Works on the model's D x D gap coverage, in place. */
+function hideNearbySubject(cov, wx, wy, ww, wh, W, D) {
+  const P = D * D;
   const fg = new Uint8Array(ww * wh);
   for (let y = 0; y < wh; y++) {
     const row = (wy + y) * W + wx, o = y * ww;
@@ -1641,7 +1690,10 @@ const handlers = {
 
   async fillInit(m) {
     const kind = m.kind || 'migan';
-    if (fills[kind]) return [{ device: fills[kind].device }];
+    if (fills[kind]) {
+      if (m.graphHi && !fills[kind].graphHi) fills[kind].graphHi = new Uint8Array(await gunzip(m.graphHi));
+      return [{ device: fills[kind].device, hi: !!fills[kind].graphHi }];
+    }
     await loadOrt(m.runtime, m.plain);
     const graph = new Uint8Array(await gunzip(m.graph));
     const weights = buildWeights(await gunzip(m.pack), m.man);
@@ -1650,8 +1702,11 @@ const handlers = {
       try { session = await makeSession(graph, weights, 'gpu'); } catch (e) { device = 'cpu'; }
     }
     if (!session) { session = await makeSession(graph, weights, 'cpu'); device = 'cpu'; }
-    fills[kind] = { session, device, graph, pack: m.pack, man: m.man, inName: session.inputNames[0], outName: session.outputNames[0] };
-    return [{ device }];
+    fills[kind] = {
+      session, sessionHi: null, device, graph, pack: m.pack, man: m.man, inName: session.inputNames[0], outName: session.outputNames[0],
+      graphHi: m.graphHi ? new Uint8Array(await gunzip(m.graphHi)) : null, lowMem: !!m.lowMem,
+    };
+    return [{ device, hi: !!fills[kind].graphHi }];
   },
 
   /* A tap with the remove tool: which area to remove. */
@@ -1668,12 +1723,12 @@ const handlers = {
     if (!img) throw new Error('No photo is loaded.');
     const kind = m.kind || 'migan';
     if (!fills[kind]) throw new Error('The fill model is not loaded yet.');
-    const r = await fillArea(m.rect, new Uint8Array(m.mask), kind, m.detail !== false);
+    const r = await fillArea(m.rect, new Uint8Array(m.mask), kind, m.detail !== false, !!m.hi);
     if (!r) return [{ empty: true }];
     const bufs = [r.wgt.buffer, r.before.buffer, r.after.buffer, r.alphaBefore.buffer, r.alphaAfter.buffer];
     return [{
       rect: r.rect, wgt: r.wgt.buffer, before: r.before.buffer, after: r.after.buffer,
-      alphaBefore: r.alphaBefore.buffer, alphaAfter: r.alphaAfter.buffer, ms: r.ms, scale: r.scale, detailMs: r.detailMs, device: fills[kind].device, kind,
+      alphaBefore: r.alphaBefore.buffer, alphaAfter: r.alphaAfter.buffer, ms: r.ms, scale: r.scale, detailMs: r.detailMs, size: r.size, device: fills[kind].device, kind,
     }, bufs];
   },
 
