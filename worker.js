@@ -830,6 +830,8 @@ async function fillArea(rect, src, kind, detail = true) {
   const t0 = performance.now();
   const out = await runFill(kind, inp);
   const ms = performance.now() - t0;
+  if (seamOn) seamless(out, planes, cov, FILL);
+  if (typeof fillDebug === 'object') Object.assign(fillDebug, { planes, cov, out: out.slice(), scale, win: { x: wx, y: wy, w: ww, h: wh } });   // test harness only
   const before = copyRect(img.rgba, W, 4, gx0, gy0, gw, gh);
   const alphaBefore = copyRect(img.alpha, W, 1, gx0, gy0, gw, gh);
   // Upscale the result to the window, but only where it lands in the gap.
@@ -945,6 +947,101 @@ function matchGrain(rgba, W, x0, y0, w, h, wgt, dOut, fw, ring) {
     const v = g * add * (wv / 255);
     const p = ((y0 + Math.floor(i / w)) * W + x0 + (i % w)) * 4;
     rgba[p] += v; rgba[p + 1] += v; rgba[p + 2] += v;
+  }
+}
+
+/* ---------- seamless edges for fills ---------- */
+let seamOn = true;   // tests can turn this off for comparisons
+/* Make the fill meet the photo at the edge of the gap. The fill models can be
+   a few levels off in colour and brightness (MI-GAN even changes the photo it
+   is given), which shows as a faint outline around a removed object. At the
+   model's 512 x 512 size, each pixel on the inside edge of the gap should equal
+   the photo just outside it. Those differences are spread across the gap as a
+   smooth membrane, as in seamless cloning (Perez et al., 2003), so the whole
+   fill shifts to fit and keeps its own shapes. Around the gap, the model's
+   version of the photo is swapped for the photo itself, so the enlarged fill
+   fades into the real photo at its edge. Works in place on out (3 planes, 0..1). */
+function seamless(out, planes, cov, D) {
+  const P = D * D, hole = new Uint8Array(P);
+  for (let i = 0; i < P; i++) hole[i] = cov[i] > 0.01 ? 1 : 0;
+  // Inside edge: gap pixels next to photo pixels. Each should match the photo around it.
+  const fixed = new Uint8Array(P), raw = new Float32Array(3 * P);
+  let nEdge = 0;
+  for (let y = 0; y < D; y++) for (let x = 0; x < D; x++) {
+    const i = y * D + x;
+    if (!hole[i]) continue;
+    let s0 = 0, s1 = 0, s2 = 0, c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const yy = y + dy, xx = x + dx;
+      if (yy < 0 || yy >= D || xx < 0 || xx >= D) continue;
+      const j = yy * D + xx;
+      if (hole[j]) continue;
+      s0 += planes[j]; s1 += planes[P + j]; s2 += planes[2 * P + j]; c++;
+    }
+    if (!c) continue;
+    fixed[i] = 1; nEdge++;
+    raw[i * 3] = s0 / c - out[i]; raw[i * 3 + 1] = s1 / c - out[P + i]; raw[i * 3 + 2] = s2 / c - out[2 * P + i];
+  }
+  if (!nEdge) return;
+  // Average the differences along the edge (nearby edge pixels only) and limit
+  // them, so a stray bit of the removed object can't tint the fill.
+  const val = new Float32Array(3 * P), R = 3, LIM = 0.2;
+  for (let y = 0; y < D; y++) for (let x = 0; x < D; x++) {
+    const i = y * D + x;
+    if (!fixed[i]) continue;
+    let s0 = 0, s1 = 0, s2 = 0, c = 0;
+    for (let yy = Math.max(0, y - R); yy <= Math.min(D - 1, y + R); yy++) for (let xx = Math.max(0, x - R); xx <= Math.min(D - 1, x + R); xx++) {
+      const j = yy * D + xx;
+      if (!fixed[j]) continue;
+      s0 += raw[j * 3]; s1 += raw[j * 3 + 1]; s2 += raw[j * 3 + 2]; c++;
+    }
+    val[i * 3] = clampN(s0 / c, -LIM, LIM); val[i * 3 + 1] = clampN(s1 / c, -LIM, LIM); val[i * 3 + 2] = clampN(s2 / c, -LIM, LIM);
+  }
+  // First guess inside the gap by push-pull (each empty cell takes the average of
+  // the edge values in the coarser cell above it), then relax towards a smooth
+  // membrane with over-relaxed Gauss-Seidel sweeps.
+  const levels = [{ w: D, h: D, S: val.slice(), C: Float32Array.from(fixed) }];
+  while (levels[levels.length - 1].w > 1) {
+    const a = levels[levels.length - 1], w = Math.ceil(a.w / 2), h = Math.ceil(a.h / 2);
+    const S = new Float32Array(3 * w * h), C = new Float32Array(w * h);
+    for (let y = 0; y < a.h; y++) for (let x = 0; x < a.w; x++) {
+      const j = y * a.w + x, c = a.C[j];
+      if (!c) continue;
+      const k = (y >> 1) * w + (x >> 1);
+      S[k * 3] += a.S[j * 3]; S[k * 3 + 1] += a.S[j * 3 + 1]; S[k * 3 + 2] += a.S[j * 3 + 2]; C[k] += c;
+    }
+    levels.push({ w, h, S, C });
+  }
+  let up = null;
+  for (let l = levels.length - 1; l >= 0; l--) {
+    const a = levels[l], V = new Float32Array(3 * a.w * a.h);
+    for (let y = 0; y < a.h; y++) for (let x = 0; x < a.w; x++) {
+      const j = y * a.w + x;
+      if (a.C[j]) { const c = a.C[j]; V[j * 3] = a.S[j * 3] / c; V[j * 3 + 1] = a.S[j * 3 + 1] / c; V[j * 3 + 2] = a.S[j * 3 + 2] / c; }
+      else if (up) { const k = (y >> 1) * up.w + (x >> 1); V[j * 3] = up.V[k * 3]; V[j * 3 + 1] = up.V[k * 3 + 1]; V[j * 3 + 2] = up.V[k * 3 + 2]; }
+    }
+    up = { V, w: a.w };
+  }
+  const v = up.V;
+  const free = [];
+  for (let i = 0; i < P; i++) if (hole[i] && !fixed[i]) free.push(i);
+  const W = 1.85;
+  for (let it = 0; it < 60; it++) {
+    for (const i of free) {
+      const x = i % D, y = (i - x) / D;
+      let s0 = 0, s1 = 0, s2 = 0, c = 0;
+      if (x > 0) { const j = i - 1; s0 += v[j * 3]; s1 += v[j * 3 + 1]; s2 += v[j * 3 + 2]; c++; }
+      if (x < D - 1) { const j = i + 1; s0 += v[j * 3]; s1 += v[j * 3 + 1]; s2 += v[j * 3 + 2]; c++; }
+      if (y > 0) { const j = i - D; s0 += v[j * 3]; s1 += v[j * 3 + 1]; s2 += v[j * 3 + 2]; c++; }
+      if (y < D - 1) { const j = i + D; s0 += v[j * 3]; s1 += v[j * 3 + 1]; s2 += v[j * 3 + 2]; c++; }
+      v[i * 3] += W * (s0 / c - v[i * 3]); v[i * 3 + 1] += W * (s1 / c - v[i * 3 + 1]); v[i * 3 + 2] += W * (s2 / c - v[i * 3 + 2]);
+    }
+  }
+  // Apply: the gap shifts by the membrane, and the photo around it is the photo.
+  const near = chamfer(hole, D, D, 1);
+  for (let i = 0; i < P; i++) {
+    if (hole[i]) { out[i] += v[i * 3]; out[P + i] += v[i * 3 + 1]; out[2 * P + i] += v[i * 3 + 2]; }
+    else if (near[i] <= 3) { out[i] = planes[i]; out[P + i] = planes[P + i]; out[2 * P + i] = planes[2 * P + i]; }
   }
 }
 

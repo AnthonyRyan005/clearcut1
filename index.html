@@ -2968,7 +2968,7 @@ if (!STANDALONE) {
 function setGap(g) {
   S.gap = g === 'clear' ? 'clear' : 'fill';
   for (const b of document.querySelectorAll('[data-gap]')) b.setAttribute('aria-pressed', String(b.dataset.gap === S.gap));
-  $('rmQualityRow').hidden = S.gap === 'clear' || PHONE;
+  $('rmQualityRow').hidden = S.gap === 'clear';
   $('rmDetailLabel').hidden = S.gap === 'clear';
   try { localStorage.setItem('clearcut.gap', S.gap); } catch (e) { /* private mode */ }
   updateQualityHint();
@@ -2988,15 +2988,16 @@ function updateQualityHint() {
   const ready = fillers[fillKind()].state === 'ready';
   $('rmQualityHint').textContent = S.quality === 'fast'
     ? `New background fills each gap to match the photo. Fast uses MI-GAN${ready ? '' : ` (${size('migan') || '11 MB'} download, once)`}, quicker on older devices.`
-    : `New background fills each gap to match the photo. Best uses LaMa${ready ? '' : ` (${size('lama') || '90 MB'} download, once)`}, which handles large areas well.`;
+    : `New background fills each gap to match the photo. Best uses LaMa${ready ? '' : ` (${size('lama') || '90 MB'} download, once)`}, which handles large areas well${PHONE ? ' and blends in more cleanly. On iPhone each removal can take 20 seconds or more' : ''}.`;
 }
 for (const b of document.querySelectorAll('[data-quality]')) b.addEventListener('click', () => setQuality(b.dataset.quality));
-try { const q = localStorage.getItem('clearcut.fill'); if (q) S.quality = q === 'fast' ? 'fast' : 'best'; } catch (e) { /* private mode */ }
-// The Best fill needs more memory than iPhone gives a web page, so iPhone uses Fast.
+// iPhone starts with Fast, which takes seconds. Best (LaMa) gives cleaner fills
+// and fits in iPhone memory, but each removal takes much longer, so it is a choice.
 if (PHONE) S.quality = 'fast';
+try { const q = localStorage.getItem('clearcut.fill'); if (q) S.quality = q === 'fast' ? 'fast' : 'best'; } catch (e) { /* private mode */ }
 try { const g = localStorage.getItem('clearcut.gap'); if (g) S.gap = g === 'clear' ? 'clear' : 'fill'; } catch (e) { /* private mode */ }
 for (const b of document.querySelectorAll('[data-gap]')) b.setAttribute('aria-pressed', String(b.dataset.gap === S.gap));
-$('rmQualityRow').hidden = S.gap === 'clear' || PHONE;
+$('rmQualityRow').hidden = S.gap === 'clear';
 $('rmDetailLabel').hidden = S.gap === 'clear';
 for (const b of document.querySelectorAll('[data-quality]')) b.setAttribute('aria-pressed', String(b.dataset.quality === S.quality));
 // Sharpen fills: on unless turned off. It applies to the next removal; Undo brings back the last one.
