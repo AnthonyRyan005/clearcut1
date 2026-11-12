@@ -770,7 +770,7 @@ async function removalArea(x, y, id) {
 /* Fill the masked area of the photo. The model sees a square-ish window with
    plenty of context, resampled to 512 x 512. Its result is blended back with a
    soft edge that sits just inside the masked area. */
-async function fillArea(rect, src, kind) {
+async function fillArea(rect, src, kind, detail = true) {
   const W = img.w, H = img.h;
   let bx0 = W, by0 = H, bx1 = -1, by1 = -1;
   for (let y = 0; y < rect.h; y++) for (let x = 0; x < rect.w; x++) {
@@ -865,12 +865,14 @@ async function fillArea(rect, src, kind) {
       alpha[i] = Math.round(alpha[i] * (1 - a));
     }
   }
-  if (scale > 1.3) matchGrain(rgba, W, gx0, gy0, gw, gh, wgt, dOut, fw, Math.max(4, Math.round(0.02 * Math.max(ww, wh))));
+  let detailMs = -1;
+  if (detail && detailOn && scale > 0.99) detailMs = addDetail(rgba, alpha, W, { x: wx, y: wy, w: ww, h: wh }, { x: gx0, y: gy0, w: gw, h: gh }, wgt, scale);
+  if (detailMs < 0 && scale > 1.3) matchGrain(rgba, W, gx0, gy0, gw, gh, wgt, dOut, fw, Math.max(4, Math.round(0.02 * Math.max(ww, wh))));
   markEdited(gx0, gy0, gw, gh);
   return {
     rect: { x: gx0, y: gy0, w: gw, h: gh }, wgt, before, alphaBefore,
     after: copyRect(rgba, W, 4, gx0, gy0, gw, gh), alphaAfter: copyRect(alpha, W, 1, gx0, gy0, gw, gh),
-    ms, scale,
+    ms, scale, detailMs,
   };
 }
 function clampN(v, a, b) { return v < a ? a : (v > b ? b : v); }
@@ -944,6 +946,347 @@ function matchGrain(rgba, W, x0, y0, w, h, wgt, dOut, fw, ring) {
     const p = ((y0 + Math.floor(i / w)) * W + x0 + (i % w)) * 4;
     rgba[p] += v; rgba[p + 1] += v; rgba[p + 2] += v;
   }
+}
+
+/* ---------- fine detail for fills ---------- */
+let detailOn = true;   // tests can turn the step off for comparisons
+/* The fill models work on 512 x 512 windows, so on a large photo the fill is
+   enlarged and looks soft beside the sharp photo around it. addDetail rebuilds
+   the missing fine detail from the photo itself.
+   The photo around the gap, fill included, is split into a soft base (coarser
+   than a 512 px window holds) and detail (the rest). For small patches of the
+   fill, PatchMatch (Barnes et al., 2009) finds patches outside the gap whose
+   soft base looks the same, and their detail is blended in. A few rounds
+   also match the detail already placed and the photo at the edge of the gap
+   (as in Wexler et al., 2007), so neighbouring patches copy from neighbouring
+   places and texture arrives in whole pieces rather than as noise. The fill
+   keeps its own colours and shapes, and its own detail where nothing matches.
+   Returns the time taken in ms, -1 when the gap is too large for the memory
+   budget, or -2 when there is too little photo around it to copy from. */
+function addDetail(rgba, alpha, W, win, g, wgt, scale) {
+  const t0 = performance.now();
+  // The soft base keeps what a window about twice as coarse as the model's holds,
+  // so the fill's blur and blotches are replaced too, not just the finest grain.
+  // On very large removals it stays a little finer, so the fill's shapes still lead.
+  const gf = Math.min(2 * scale, scale + 3);
+  const pr = Math.max(3, Math.min(12, Math.round(gf)));   // patch radius
+  const step = Math.max(2, Math.round(pr / 2));           // spacing of patch centres
+  const ROUNDS = 2;
+  // Work area: the gap and the photo around it, inside the window the model saw.
+  // About 23 bytes per work pixel and 28 per gap pixel; kept under 150 MB, which
+  // a phone can spare. A gap too large for that keeps the model's result.
+  const bytes = (m) => 23 * (g.w + 2 * m) * (g.h + 2 * m) + 28 * g.w * g.h;
+  let M = Math.max(48, Math.round(0.75 * Math.max(g.w, g.h)));
+  while (M > 48 && bytes(M) > 150e6) M = Math.max(48, Math.floor(M * 0.8));
+  if (bytes(M) > 150e6) return -1;
+  const ax0 = Math.max(win.x, g.x - M), ay0 = Math.max(win.y, g.y - M);
+  const ax1 = Math.min(win.x + win.w, g.x + g.w + M), ay1 = Math.min(win.y + win.h, g.y + g.h + M);
+  const aw = ax1 - ax0, ah = ay1 - ay0, n = aw * ah;
+  const gox = g.x - ax0, goy = g.y - ay0;
+  // Soft base: shrink by gf and enlarge again, per colour.
+  const dw = Math.max(4, Math.round(aw / gf)), dh = Math.max(4, Math.round(ah / gf));
+  const plane = new Float32Array(n), L = [];
+  for (let c = 0; c < 3; c++) {
+    for (let y = 0; y < ah; y++) {
+      const row = ((ay0 + y) * W + ax0) * 4 + c, o = y * aw;
+      for (let x = 0; x < aw; x++) plane[o + x] = rgba[row + x * 4];
+    }
+    L.push(resizePlane(resizePlane(plane, aw, ah, dw, dh), dw, dh, aw, ah));
+  }
+  const Lr = L[0], Lg = L[1], Lb = L[2];
+  // Targets: every pixel the fill touched. dT: distance to the nearest one.
+  const T = new Uint8Array(n);
+  for (let y = 0; y < g.h; y++) for (let x = 0; x < g.w; x++) if (wgt[y * g.w + x]) T[(goy + y) * aw + gox + x] = 1;
+  const dT = chamfer(T, aw, ah, 1);
+  // Detail as luma, for matching. F: 2 photo, 1 placed in an earlier round, 0 none yet.
+  const Dy = new Float32Array(n), F = new Uint8Array(n);
+  for (let y = 0; y < ah; y++) {
+    const row = ((ay0 + y) * W + ax0) * 4;
+    for (let x = 0; x < aw; x++) {
+      const i = y * aw + x;
+      if (T[i]) continue;
+      const p = row + x * 4;
+      Dy[i] = 0.299 * (rgba[p] - Lr[i]) + 0.587 * (rgba[p + 1] - Lg[i]) + 0.114 * (rgba[p + 2] - Lb[i]);
+      F[i] = 2;
+    }
+  }
+  const WF = [0, 0.5, 1];
+  // Sources: patch centres whose whole patch is photo, clear of the gap.
+  // Background is preferred over the cut-out subject when there is enough of it.
+  const V = new Uint8Array(n), guard = pr + 2;
+  let nAll = 0, nBg = 0;
+  for (let y = pr; y < ah - pr; y++) {
+    for (let x = pr; x < aw - pr; x++) {
+      const i = y * aw + x;
+      if (dT[i] <= guard) continue;
+      nAll++;
+      if (alpha[(ay0 + y) * W + ax0 + x] < 128) { V[i] = 2; nBg++; } else V[i] = 1;
+    }
+  }
+  const need = nBg >= Math.max(2000, 0.15 * nAll) ? 2 : 1;
+  const nSrc = need === 2 ? nBg : nAll;
+  if (nSrc < 500) return -2;
+  // A sample of the sources (at most about a million) to start the search from.
+  const every = Math.ceil(nSrc / 1e6), src = new Int32Array(Math.ceil(nSrc / every));
+  for (let i = 0, k = 0, c = 0; i < n; i++) if (V[i] >= need && c++ % every === 0) src[k++] = i;
+  const nPick = src.length;
+  const ok = (qx, qy) => qx >= pr && qy >= pr && qx < aw - pr && qy < ah - pr && V[qy * aw + qx] >= need;
+  // Patch centres on a grid, wherever a patch would touch the fill.
+  const gW = Math.ceil(aw / step), gH = Math.ceil(ah / step);
+  const gi = new Int32Array(gW * gH).fill(-1);
+  let nc = 0;
+  for (let gy = 0; gy < gH; gy++) for (let gx = 0; gx < gW; gx++) if (dT[gy * step * aw + gx * step] <= pr) gi[gy * gW + gx] = nc++;
+  const cx = new Int32Array(nc), cy = new Int32Array(nc);
+  for (let gy = 0; gy < gH; gy++) for (let gx = 0; gx < gW; gx++) { const k = gi[gy * gW + gx]; if (k >= 0) { cx[k] = gx * step; cy[k] = gy * step; } }
+  // Patches are compared at every other pixel.
+  const offs = [], NO = Math.min(pr + 1, 6);
+  for (let a = 0; a < NO; a++) offs.push(Math.round(-pr + (2 * pr * a) / (NO - 1)));
+  const no = offs.length;
+  function cost(x, y, qx, qy, cut) {
+    let d = 0;
+    for (let a = 0; a < no; a++) {
+      const ty = y + offs[a];
+      if (ty < 0 || ty >= ah) continue;
+      const tr = ty * aw, sr = (qy + offs[a]) * aw + qx;
+      for (let b = 0; b < no; b++) {
+        const tx = x + offs[b];
+        if (tx < 0 || tx >= aw) continue;
+        const ti = tr + tx, si = sr + offs[b];
+        const er = Lr[ti] - Lr[si], eg = Lg[ti] - Lg[si], eb = Lb[ti] - Lb[si];
+        d += er * er + eg * eg + eb * eb;
+        const f = F[ti];
+        if (f) { const e = Dy[ti] - Dy[si]; d += WF[f] * e * e; }
+      }
+      if (d >= cut) return d;
+    }
+    return d;
+  }
+  let seed = (g.x * 73856093) ^ (g.y * 19349663) ^ (g.w * 83492791) ^ g.h ^ 0x9e3779b9;
+  const rnd = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) / 4294967296; };
+  const nx = new Int32Array(nc), ny = new Int32Array(nc), nd = new Float32Array(nc);
+  for (let k = 0; k < nc; k++) {
+    let best = Infinity, bx = 0, by = 0;
+    for (let t = 0; t < 4; t++) {
+      const s = src[Math.floor(rnd() * nPick)], qx = s % aw, qy = (s - qx) / aw;
+      const d = cost(cx[k], cy[k], qx, qy, best);
+      if (d < best) { best = d; bx = qx; by = qy; }
+    }
+    nx[k] = bx; ny[k] = by; nd[k] = best;
+  }
+  const R0 = Math.max(aw, ah);
+  // A match that continues a neighbour's match is kept unless another is clearly
+  // better, so whole stretches of texture are copied together.
+  const KEEP = 2;
+  function sweep(dir, reach) {
+    for (let j = 0; j < nc; j++) {
+      const k = dir > 0 ? j : nc - 1 - j;
+      const x = cx[k], y = cy[k], gx = x / step, gy = y / step;
+      let best = nd[k], bias = nd[k], bx = nx[k], by = ny[k];
+      // Take the neighbours' matches, shifted along.
+      const ga = gx - dir, gb = gy - dir;
+      const kh = ga >= 0 && ga < gW ? gi[gy * gW + ga] : -1;
+      if (kh >= 0) {
+        const qx = nx[kh] + dir * step, qy = ny[kh];
+        if ((qx !== bx || qy !== by) && ok(qx, qy)) {
+          const d = cost(x, y, qx, qy, bias * KEEP);
+          if (d < bias * KEEP) { best = d; bias = d / KEEP; bx = qx; by = qy; }
+        }
+      }
+      const kv = gb >= 0 && gb < gH ? gi[gb * gW + gx] : -1;
+      if (kv >= 0) {
+        const qx = nx[kv], qy = ny[kv] + dir * step;
+        if ((qx !== bx || qy !== by) && ok(qx, qy)) {
+          const d = cost(x, y, qx, qy, bias * KEEP);
+          if (d < bias * KEEP) { best = d; bias = d / KEEP; bx = qx; by = qy; }
+        }
+      }
+      // Look around the best match so far, nearer and nearer.
+      for (let r = reach; r >= 1; r >>= 1) {
+        const qx = bx + Math.round((rnd() * 2 - 1) * r), qy = by + Math.round((rnd() * 2 - 1) * r);
+        if (!ok(qx, qy)) continue;
+        const d = cost(x, y, qx, qy, bias);
+        if (d < bias) { best = d; bias = d; bx = qx; by = qy; }
+      }
+      nx[k] = bx; ny[k] = by; nd[k] = best;
+    }
+  }
+  const gw = g.w, gh = g.h, gn = gw * gh;
+  const sp = new Float32Array(2 * pr + 1);
+  for (let u = -pr; u <= pr; u++) sp[u + pr] = 1 - Math.abs(u) / (pr + 1);
+  const per = new Float32Array(nc);
+  // The model's own detail (fill minus soft base) also gets a small say, so where
+  // no patch of the photo matches well it is kept and poor matches can't leave a
+  // patchwork. Its weight is a share of what all the patches over a pixel would
+  // weigh if they agreed: about ((pr + 1) / step) squared.
+  const cover = ((pr + 1) / step) * ((pr + 1) / step);
+  // Each pixel of the fill takes its detail from the patch centred nearest to it,
+  // blended with the other patches that copy from the same place (within a
+  // pixel). Patches copying from elsewhere are left out, so the detail stays
+  // sharp instead of averaging different textures together.
+  const near = new Int32Array(gn).fill(-1);
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const q = y * gw + x;
+    if (!wgt[q]) continue;
+    const X = gox + x, Y = goy + y, gx = Math.round(X / step), gy = Math.round(Y / step);
+    let k = gx < gW && gy < gH ? gi[gy * gW + gx] : -1;
+    for (let r = 1; k < 0 && r <= 2; r++) {
+      let bd = Infinity;
+      for (let b = gy - r; b <= gy + r; b++) for (let a = gx - r; a <= gx + r; a++) {
+        if (a < 0 || b < 0 || a >= gW || b >= gH) continue;
+        const kk = gi[b * gW + a];
+        if (kk < 0) continue;
+        const d = (a * step - X) * (a * step - X) + (b * step - Y) * (b * step - Y);
+        if (d < bd) { bd = d; k = kk; }
+      }
+    }
+    near[q] = k;
+  }
+  // accG gathers the copied detail and then holds the result.
+  const accG = new Float32Array(gn * 3), wG = new Float32Array(gn), det = accG;
+  const OWN = 0.02, TOL = 1;
+  // A match that differs by more than this (per sample, squared levels) is a poor
+  // one and fades out, so the model's own result is kept where nothing fits.
+  let e2 = 0, ne = 0;
+  for (let i = 0; i < n; i += 3) if (F[i] === 2) { e2 += Dy[i] * Dy[i]; ne++; }
+  const BAD = Math.max(150, 4 * e2 / Math.max(1, ne));
+  function vote(last) {
+    accG.fill(0); wG.fill(0);
+    // Better matches count for more. s2: the typical cost per sample.
+    for (let k = 0; k < nc; k++) per[k] = nd[k] / (no * no);
+    const sorted = per.slice().sort();
+    const s2 = Math.max(1, sorted[sorted.length >> 1]);
+    for (let k = 0; k < nc; k++) per[k] = Math.exp(-0.5 * per[k] / s2) * (per[k] > BAD ? Math.exp(1 - per[k] / BAD) : 1);
+    for (let k = 0; k < nc; k++) {
+      const x = cx[k], y = cy[k], qx = nx[k], qy = ny[k], ox = qx - x, oy = qy - y, wk = per[k];
+      for (let v = -pr; v <= pr; v++) {
+        const ty = y + v - goy;
+        if (ty < 0 || ty >= gh) continue;
+        const sy = qy + v, wv = wk * sp[v + pr], srow = sy * aw + qx, prow = ((ay0 + sy) * W + ax0 + qx) * 4, trow = ty * gw;
+        for (let u = -pr; u <= pr; u++) {
+          const tx = x + u - gox;
+          if (tx < 0 || tx >= gw) continue;
+          const q = trow + tx, kn = near[q];
+          if (kn < 0) continue;
+          const ex = nx[kn] - cx[kn] - ox, ey = ny[kn] - cy[kn] - oy;
+          if (ex > TOL || ex < -TOL || ey > TOL || ey < -TOL) continue;
+          const si = srow + u, w2 = wv * sp[u + pr];
+          if (last) {
+            const p = prow + u * 4;
+            accG[q * 3] += w2 * (rgba[p] - Lr[si]);
+            accG[q * 3 + 1] += w2 * (rgba[p + 1] - Lg[si]);
+            accG[q * 3 + 2] += w2 * (rgba[p + 2] - Lb[si]);
+          } else accG[q * 3] += w2 * Dy[si];
+          wG[q] += w2;
+        }
+      }
+    }
+    const w0 = OWN * cover;
+    for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+      const q = y * gw + x;
+      if (near[q] < 0) continue;
+      const inv = 1 / (wG[q] + w0), i = (goy + y) * aw + gox + x, p = ((g.y + y) * W + g.x + x) * 4;
+      const or = rgba[p] - Lr[i], og = rgba[p + 1] - Lg[i], ob = rgba[p + 2] - Lb[i];
+      if (last) {
+        det[q * 3] = (accG[q * 3] + w0 * or) * inv;
+        det[q * 3 + 1] = (accG[q * 3 + 1] + w0 * og) * inv;
+        det[q * 3 + 2] = (accG[q * 3 + 2] + w0 * ob) * inv;
+        Dy[i] = 0.299 * det[q * 3] + 0.587 * det[q * 3 + 1] + 0.114 * det[q * 3 + 2];
+      } else {
+        Dy[i] = (accG[q * 3] + w0 * (0.299 * or + 0.587 * og + 0.114 * ob)) * inv;
+      }
+      F[i] = 1;
+    }
+  }
+  const tPrep = performance.now() - t0;
+  let tMatch = 0, tVote = 0;
+  for (let round = 0; round < ROUNDS; round++) {
+    const ta = performance.now();
+    if (round) for (let k = 0; k < nc; k++) nd[k] = cost(cx[k], cy[k], nx[k], ny[k], Infinity);
+    sweep(1, round ? 64 : R0);
+    sweep(-1, round ? 16 : R0 >> 2);
+    const tb = performance.now();
+    vote(round === ROUNDS - 1);
+    tMatch += tb - ta; tVote += performance.now() - tb;
+  }
+  if (typeof detailStats === 'object') {   // only defined by the test harness
+    let same = 0, pairs = 0;
+    for (let gy = 0; gy < gH; gy++) for (let gx = 0; gx + 1 < gW; gx++) {
+      const a = gi[gy * gW + gx], b = gi[gy * gW + gx + 1];
+      if (a < 0 || b < 0) continue;
+      pairs++;
+      if (nx[b] - nx[a] === step && ny[b] === ny[a]) same++;
+    }
+    Object.assign(detailStats, { prep: Math.round(tPrep), match: Math.round(tMatch), vote: Math.round(tVote), nc, pr, step, n, coherent: +(same / Math.max(1, pairs)).toFixed(3), sources: nSrc });
+  }
+  // The copied detail may be no stronger than the photo's own detail nearby, so
+  // a plain wall can't pick up bricks from somewhere else. Detail strength is
+  // measured on a coarse grid of cells and carried into the gap from its edges.
+  const gain = detailGain(Dy, F, aw, ah, gox, goy, gw, gh, det, near, Math.max(4, 2 * pr));
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      const q = y * gw + x, wv = wgt[q];
+      if (!wv) continue;
+      const i = (goy + y) * aw + gox + x, p = ((g.y + y) * W + g.x + x) * 4, a = wv / 255, s = gain[q];
+      rgba[p] += a * (Lr[i] + s * det[q * 3] - rgba[p]);
+      rgba[p + 1] += a * (Lg[i] + s * det[q * 3 + 1] - rgba[p + 1]);
+      rgba[p + 2] += a * (Lb[i] + s * det[q * 3 + 2] - rgba[p + 2]);
+    }
+  }
+  return performance.now() - t0;
+}
+/* Per pixel of the fill, a factor (at most 1) that brings the strength of the
+   new detail down to the strength of the photo's detail around it. Cells of
+   f x f pixels: the photo's detail energy in each, then filled into the gap by
+   push-pull (each empty cell takes the value of the coarser level above it). */
+function detailGain(Dy, F, aw, ah, gox, goy, gw, gh, det, near, f) {
+  const cw = Math.ceil(aw / f), ch = Math.ceil(ah / f), nCell = cw * ch;
+  const S = new Float32Array(nCell), C = new Float32Array(nCell), Ss = new Float32Array(nCell), Cs = new Float32Array(nCell);
+  for (let y = 0; y < ah; y++) {
+    const crow = ((y / f) | 0) * cw;
+    for (let x = 0; x < aw; x++) {
+      const i = y * aw + x;
+      if (F[i] === 2) { const c = crow + ((x / f) | 0); S[c] += Dy[i] * Dy[i]; C[c]++; }
+    }
+  }
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const q = y * gw + x;
+    if (near[q] < 0) continue;
+    const c = (((goy + y) / f) | 0) * cw + (((gox + x) / f) | 0);
+    const v = 0.299 * det[q * 3] + 0.587 * det[q * 3 + 1] + 0.114 * det[q * 3 + 2];
+    Ss[c] += v * v; Cs[c]++;
+  }
+  // Push: sums over 2 x 2 blocks, level by level. Pull: empty cells take the level above.
+  const levels = [{ w: cw, h: ch, S, C }];
+  while (levels[levels.length - 1].w > 1 || levels[levels.length - 1].h > 1) {
+    const a = levels[levels.length - 1], w = Math.ceil(a.w / 2), h = Math.ceil(a.h / 2);
+    const S2 = new Float32Array(w * h), C2 = new Float32Array(w * h);
+    for (let y = 0; y < a.h; y++) for (let x = 0; x < a.w; x++) {
+      const c = (y >> 1) * w + (x >> 1);
+      // Only well-covered cells count, so a few photo pixels at the gap's edge don't decide.
+      if (a.C[y * a.w + x] >= (levels.length === 1 ? 0.3 * f * f : 1)) { S2[c] += a.S[y * a.w + x]; C2[c] += a.C[y * a.w + x]; }
+    }
+    levels.push({ w, h, S: S2, C: C2 });
+  }
+  let up = null;
+  for (let l = levels.length - 1; l >= 0; l--) {
+    const a = levels[l], V = new Float32Array(a.w * a.h);
+    for (let y = 0; y < a.h; y++) for (let x = 0; x < a.w; x++) {
+      const c = y * a.w + x, enough = a.C[c] >= (l === 0 ? 0.3 * f * f : 1);
+      V[c] = enough ? a.S[c] / a.C[c] : (up ? up.V[(y >> 1) * up.w + (x >> 1)] : 0);
+    }
+    up = { V, w: a.w };
+  }
+  const E = up.V;
+  const gain = new Float32Array(gw * gh);
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const q = y * gw + x;
+    const c = (((goy + y) / f) | 0) * cw + (((gox + x) / f) | 0);
+    const have = Cs[c] ? Ss[c] / Cs[c] : 0;
+    const lim = E[c];
+    gain[q] = have > lim ? Math.sqrt(lim / have) : 1;
+  }
+  // Smooth the factor so cell edges don't show.
+  return boxMean(boxMean(gain, gw, gh, f >> 1), gw, gh, f >> 1);
 }
 
 /* ---------- PNG encoder (straight alpha, no premultiply loss) ---------- */
@@ -1128,12 +1471,12 @@ const handlers = {
     if (!img) throw new Error('No photo is loaded.');
     const kind = m.kind || 'migan';
     if (!fills[kind]) throw new Error('The fill model is not loaded yet.');
-    const r = await fillArea(m.rect, new Uint8Array(m.mask), kind);
+    const r = await fillArea(m.rect, new Uint8Array(m.mask), kind, m.detail !== false);
     if (!r) return [{ empty: true }];
     const bufs = [r.wgt.buffer, r.before.buffer, r.after.buffer, r.alphaBefore.buffer, r.alphaAfter.buffer];
     return [{
       rect: r.rect, wgt: r.wgt.buffer, before: r.before.buffer, after: r.after.buffer,
-      alphaBefore: r.alphaBefore.buffer, alphaAfter: r.alphaAfter.buffer, ms: r.ms, scale: r.scale, device: fills[kind].device, kind,
+      alphaBefore: r.alphaBefore.buffer, alphaAfter: r.alphaAfter.buffer, ms: r.ms, scale: r.scale, detailMs: r.detailMs, device: fills[kind].device, kind,
     }, bufs];
   },
 

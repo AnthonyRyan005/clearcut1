@@ -486,6 +486,7 @@ a.btn { text-decoration: none; }
           </div>
         </div>
         <p class="hint" id="rmQualityHint">Best uses LaMa (90 MB download, once). Handles large areas well.</p>
+        <label class="check" id="rmDetailLabel" title="Rebuilds fine texture in each fill from matching parts of your photo"><input type="checkbox" id="rmDetail" checked> Sharpen fills with texture from the photo</label>
         <button class="btn primary" type="button" id="rmGo" disabled>Remove</button>
         <div class="row">
           <button class="btn" type="button" id="rmClear" disabled title="Clear the selection">Clear</button>
@@ -660,7 +661,7 @@ const S = {
   objects: [], objSeq: 0, composing: false, composeAgain: false, embedded: false,
   crop: null, draft: null, ratio: 'free', ratioTurned: false,
   timing: null, cutBusy: false,
-  sel: [], selSeq: 0, removing: false, editCanvas: null, editCtx: null, keptEdits: false, quality: 'best', gap: 'fill',
+  sel: [], selSeq: 0, removing: false, editCanvas: null, editCtx: null, keptEdits: false, quality: 'best', gap: 'fill', detail: true,
 };
 let dpr = 1;
 let tok = {};
@@ -2124,7 +2125,7 @@ async function removeSelected() {
       const { rect, mask } = groups[g];
       const res = clear
         ? await rpc('removeClear', { rect, mask: mask.buffer }, [mask.buffer])
-        : await rpc('removeFill', { kind, rect, mask: mask.buffer }, [mask.buffer]);
+        : await rpc('removeFill', { kind, rect, mask: mask.buffer, detail: S.detail && !window.__clearcut.noDetail }, [mask.buffer]);
       if (res.empty) continue;
       const p = {
         rect: res.rect, before: new Uint8ClampedArray(res.before), after: new Uint8ClampedArray(res.after),
@@ -2134,7 +2135,7 @@ async function removeSelected() {
       captureTiles(p.rect, tiles);
       scaleAlpha(p.rect, p.wgt);
       patches.push(p);
-      window.__clearcut.lastFill = { ms: res.ms, scale: res.scale, device: res.device, kind: res.kind };
+      window.__clearcut.lastFill = { ms: res.ms, scale: res.scale, detailMs: res.detailMs, device: res.device, kind: res.kind };
       schedule();
     }
     if (patches.length) {
@@ -2968,6 +2969,7 @@ function setGap(g) {
   S.gap = g === 'clear' ? 'clear' : 'fill';
   for (const b of document.querySelectorAll('[data-gap]')) b.setAttribute('aria-pressed', String(b.dataset.gap === S.gap));
   $('rmQualityRow').hidden = S.gap === 'clear' || PHONE;
+  $('rmDetailLabel').hidden = S.gap === 'clear';
   try { localStorage.setItem('clearcut.gap', S.gap); } catch (e) { /* private mode */ }
   updateQualityHint();
   if (S.tool === 'remove') prepareRemove();
@@ -2995,7 +2997,15 @@ if (PHONE) S.quality = 'fast';
 try { const g = localStorage.getItem('clearcut.gap'); if (g) S.gap = g === 'clear' ? 'clear' : 'fill'; } catch (e) { /* private mode */ }
 for (const b of document.querySelectorAll('[data-gap]')) b.setAttribute('aria-pressed', String(b.dataset.gap === S.gap));
 $('rmQualityRow').hidden = S.gap === 'clear' || PHONE;
+$('rmDetailLabel').hidden = S.gap === 'clear';
 for (const b of document.querySelectorAll('[data-quality]')) b.setAttribute('aria-pressed', String(b.dataset.quality === S.quality));
+// Sharpen fills: on unless turned off. It applies to the next removal; Undo brings back the last one.
+try { S.detail = localStorage.getItem('clearcut.detail') !== '0'; } catch (e) { /* private mode */ }
+$('rmDetail').checked = S.detail;
+$('rmDetail').addEventListener('change', (e) => {
+  S.detail = e.target.checked;
+  try { localStorage.setItem('clearcut.detail', S.detail ? '1' : '0'); } catch (err) { /* private mode */ }
+});
 $('trim').addEventListener('change', (e) => { S.trim = e.target.checked; updateUI(); });
 function setSticker(on) {
   S.sticker = !!on;
