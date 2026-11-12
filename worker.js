@@ -814,6 +814,7 @@ async function fillArea(rect, src, kind, detail = true) {
   for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) if (grown[y * gw + x]) winHole[(gy0 - wy + y) * ww + (gx0 - wx + x)] = 1;
   const planes = resampleRGBA(img.rgba, W, wx, wy, ww, wh, FILL);
   const cov = resampleMask(winHole, ww, wh, FILL);
+  if (subjectAware) hideNearbySubject(cov, wx, wy, ww, wh, W);
   const P = FILL * FILL, inp = new Float32Array(4 * P);
   for (let i = 0; i < P; i++) {
     const known = cov[i] > 0.01 ? 0 : 1;
@@ -948,6 +949,105 @@ function matchGrain(rgba, W, x0, y0, w, h, wgt, dOut, fw, ring) {
     const p = ((y0 + Math.floor(i / w)) * W + x0 + (i % w)) * 4;
     rgba[p] += v; rgba[p + 1] += v; rgba[p + 2] += v;
   }
+}
+
+/* ---------- fills next to the cut-out subject ---------- */
+let subjectAware = true;   // tests can turn this off for comparisons
+/* When a gap borders the cut-out subject (say, a person removed from beside
+   another person), fill models stretch the subject's colours into the gap and
+   leave a smudge. Here the nearby subject is hidden from the model as well, so
+   it rebuilds the background behind both; only the gap itself takes the fill,
+   and the subject stays exactly as it was. Not done when the gap sits mostly
+   inside the subject (a mark on a shirt), where the subject is the right
+   context, or when hiding it would leave the model too little to work from.
+   Where the removed object crossed in front of the subject (an arm across
+   someone's body), the subject carries on behind the gap. Those parts are
+   found by closing the subject's shape across the gap: a narrow part of the
+   gap with subject on both sides closes up. The subject next to them stays
+   visible, so the model continues it there.
+   Works on the model's 512 x 512 gap coverage, in place. */
+function hideNearbySubject(cov, wx, wy, ww, wh, W) {
+  const D = FILL, P = D * D;
+  const fg = new Uint8Array(ww * wh);
+  for (let y = 0; y < wh; y++) {
+    const row = (wy + y) * W + wx, o = y * ww;
+    for (let x = 0; x < ww; x++) fg[o + x] = img.alpha[row + x] >= 128 ? 1 : 0;
+  }
+  const fgCov = resampleMask(fg, ww, wh, D);
+  const hole = new Uint8Array(P), subj = new Uint8Array(P);
+  let nHole = 0, x0 = D, y0 = D, x1 = -1, y1 = -1;
+  for (let i = 0; i < P; i++) {
+    if (cov[i] > 0.01) {
+      hole[i] = 1; nHole++;
+      const x = i % D, y = (i - x) / D;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    } else if (fgCov[i] > 0.5) subj[i] = 1;
+  }
+  if (!nHole) return;
+  const dist = chamfer(hole, D, D, 1);
+  // How much of the gap's edge is subject?
+  let ring = 0, ringFg = 0;
+  for (let i = 0; i < P; i++) if (!hole[i] && dist[i] <= 3) { ring++; if (subj[i]) ringFg++; }
+  const share = ringFg / Math.max(1, ring);
+  if (share < 0.03 || share >= 0.5) return;
+  const big = Math.max(x1 - x0 + 1, y1 - y0 + 1), reach = 0.6 * big;
+  // Close the subject with a disc about a sixteenth of the gap's size: wide
+  // enough to bridge a limb, narrow enough not to join two people either side
+  // of a removed person.
+  const r = Math.max(4, Math.round(big / 16));
+  const dS = chamfer(subj, D, D, 1), far = new Uint8Array(P);
+  for (let i = 0; i < P; i++) far[i] = dS[i] > r ? 1 : 0;
+  const dF = chamfer(far, D, D, 1), behind = new Uint8Array(P);
+  for (let i = 0; i < P; i++) if (hole[i] && dF[i] > r) behind[i] = 1;
+  // Slivers smaller than a short piece of limb are noise from the outlines.
+  const stack = new Int32Array(P), part = [];
+  let nBehind = 0;
+  for (let s = 0; s < P; s++) {
+    if (behind[s] !== 1) continue;
+    let top = 0; stack[top++] = s; behind[s] = 2; part.length = 0;
+    while (top) {
+      const i = stack[--top], x = i % D;
+      part.push(i);
+      if (x > 0 && behind[i - 1] === 1) { behind[i - 1] = 2; stack[top++] = i - 1; }
+      if (x < D - 1 && behind[i + 1] === 1) { behind[i + 1] = 2; stack[top++] = i + 1; }
+      if (i >= D && behind[i - D] === 1) { behind[i - D] = 2; stack[top++] = i - D; }
+      if (i < P - D && behind[i + D] === 1) { behind[i + D] = 2; stack[top++] = i + D; }
+    }
+    const v = part.length >= r * r / 2 ? 3 : 0;
+    for (const i of part) behind[i] = v;
+    if (v) nBehind += part.length;
+  }
+  // Which outline is the shared edge? Bodies are mostly rounded, so the one in
+  // front bulges into the one behind. Where the gap bulges into the subject (it
+  // fills less than about half of a small box centred on the edge), the removed
+  // object was in front and the subject carries on behind it.
+  const R = Math.max(6, Math.round(big / 24)), S1 = D + 1;
+  const sumH = new Int32Array(S1 * S1), sumS = new Int32Array(S1 * S1);
+  for (let y = 0; y < D; y++) for (let x = 0; x < D; x++) {
+    const i = y * D + x, k = (y + 1) * S1 + x + 1;
+    sumH[k] = hole[i] + sumH[k - 1] + sumH[k - S1] - sumH[k - S1 - 1];
+    sumS[k] = subj[i] + sumS[k - 1] + sumS[k - S1] - sumS[k - S1 - 1];
+  }
+  const box = (t, xa, ya, xb, yb) => t[yb * S1 + xb] - t[ya * S1 + xb] - t[yb * S1 + xa] + t[ya * S1 + xa];
+  const front = new Uint8Array(P);
+  let nEdge = 0, nFront = 0;
+  for (let y = 0; y < D; y++) for (let x = 0; x < D; x++) {
+    const i = y * D + x;
+    if (!hole[i] || !((x > 0 && subj[i - 1]) || (x < D - 1 && subj[i + 1]) || (y > 0 && subj[i - D]) || (y < D - 1 && subj[i + D]))) continue;
+    nEdge++;
+    const xa = Math.max(0, x - R), ya = Math.max(0, y - R), xb = Math.min(D, x + R + 1), yb = Math.min(D, y + R + 1);
+    const a = box(sumH, xa, ya, xb, yb), b = box(sumS, xa, ya, xb, yb);
+    if (a < 0.42 * (a + b)) { front[i] = 1; nFront++; }
+  }
+  // A few such points are noise from ragged outlines.
+  if (nFront >= Math.max(8, 0.1 * nEdge)) for (let i = 0; i < P; i++) if (front[i]) { behind[i] = 3; nBehind++; }
+  const dB = nBehind ? chamfer(behind, D, D, 3) : null;
+  const hide = (i) => subj[i] && dist[i] <= reach && !(dB && dB[i] <= 2 * r);
+  let add = 0;
+  for (let i = 0; i < P; i++) if (hide(i)) add++;
+  if (!add || (nHole + add) / P > 0.6) return;
+  for (let i = 0; i < P; i++) if (hide(i)) cov[i] = 1;
+  if (typeof fillDebug === 'object') Object.assign(fillDebug, { behind, subj, hole });   // test harness only
 }
 
 /* ---------- seamless edges for fills ---------- */

@@ -446,6 +446,7 @@ a.btn { text-decoration: none; }
         <h2 class="label" id="hPhoto">Photo</h2>
         <button class="btn primary big" type="button" id="chooseBtn">Choose photo</button>
         <p class="hint">Or drop a photo on the mat, or paste one. JPG, PNG and WebP work everywhere.</p>
+        <div class="row"><button class="btn" type="button" id="startOver" disabled title="Undo every edit and go back to the original photo">Start over</button></div>
         <dl class="facts">
           <dt>File</dt><dd id="factName">Example (espresso cup)</dd>
           <dt>Size</dt><dd class="mono" id="factSize">600 × 400 px</dd>
@@ -511,7 +512,7 @@ a.btn { text-decoration: none; }
             <button class="btn" type="button" id="dsStop" disabled>Stop</button>
           </div>
         </div>
-        <p class="hint" id="dsHint">Writes a prompt that an image generator can use to recreate this image. Runs Florence-2 PromptGen on this device. The first use downloads about 270 MB from this app and keeps it for offline use.</p>
+        <p class="hint" id="dsHint">Writes a prompt that an image generator can use to recreate this image. It looks at your subject close up, and at the whole picture when the background is a photo, then combines the two. For people, it adds their pose, movement and expression. Runs Florence-2 PromptGen on this device. The first use downloads about 270 MB from this app and keeps it for offline use. Check the details before you use the prompt, because the model can still get some wrong.</p>
       </section>
 
       <section class="panel" aria-labelledby="hCrop">
@@ -1671,6 +1672,7 @@ async function loadExample() {
   const md = mx.getImageData(0, 0, 1024, 1024).data;
   const mask = new Float32Array(1024 * 1024);
   for (let i = 0; i < mask.length; i++) mask[i] = md[i * 4] / 255;
+  S.mask = mask.slice();
   const copy = orig.data.slice().buffer;
   const res = await rpc('refine', { rgba: copy, w, h, mask: mask.buffer }, [copy, mask.buffer]);
   if (id !== S.photoId) return;
@@ -2182,6 +2184,50 @@ async function restorePhoto() {
 }
 const removedCount = () => S.history.reduce((n, e) => n + (e.tool === 'remove' ? e.count : 0), 0);
 
+/* ---------- start over ---------- */
+/* Every edit to this photo, removals too old to undo included. */
+const hasEdits = () => !!(S.history.length || S.objects.length || S.crop || S.keptEdits);
+/* Back to the photo as it was opened, with the model's own cutout: removals,
+   touch-ups, picks and crop are gone, and every tool works on it as before.
+   The model doesn't need to run again. Asks for a second tap first. */
+async function startOver() {
+  if (locked() || !S.cut || !S.origCanvas || !hasEdits()) return;
+  if (!S.startArmed) {
+    S.startArmed = setTimeout(() => { S.startArmed = 0; updateUI(); }, 4000);
+    updateUI();
+    return;
+  }
+  clearTimeout(S.startArmed); S.startArmed = 0;
+  const id = S.photoId;
+  if (S.tool === 'crop') { cancelCrop(); setTool('move'); }
+  S.composing = true; updateUI();
+  try {
+    S.orig = S.origCanvas.getContext('2d').getImageData(0, 0, S.w, S.h);
+    S.history = []; S.future = []; S.historyBytes = 0;
+    S.objects = []; S.sel = []; rmStroke = null;
+    S.editCanvas = null; S.editCtx = null; S.keptEdits = false;
+    S.crop = null; S.draft = null; $('cropBar').hidden = true;
+    S.blurCanvas = null; boxCache = null; stickerCache = null;
+    S.embedded = false; embedPromise = null;
+    if (S.mask) {
+      const rgba = S.orig.data.slice().buffer, mask = S.mask.slice().buffer;
+      const res = await rpc('refine', { rgba, w: S.w, h: S.h, mask }, [rgba, mask]);
+      if (id !== S.photoId) return;
+      setCut(res.cut);
+    }
+    S.view.fit = true; fitView();
+    toast('Back to the original photo');
+  } catch (e) {
+    console.error(e);
+    toast("Couldn't start over: " + (e && e.message ? e.message : e), 4600);
+    window.__clearcut.errors.push('start over: ' + (e && e.message || e));
+  } finally {
+    S.composing = false;
+    updateUI(); schedule();
+  }
+  if (!S.mask && id === S.photoId) runCutout();
+}
+
 /* ---------- describe as prompt (Florence-2 PromptGen, web app builds only) ---------- */
 const describer = { worker: null, busy: false, style: 'prompt', ready: false, promise: null, waitReady: null, idle: 0 };
 /* The description model uses about 0.8 GB on the processor. Close its worker
@@ -2283,22 +2329,58 @@ function ensureDescriber() {
   })().catch((e) => { describer.promise = null; throw e; });
   return describer.promise;
 }
-/* The image as you would save it: background, cutout and crop, at most `max` px. */
-function describeSource(max) {
-  const crop = S.crop || fullRect();
-  const k = Math.min(1, max / Math.max(crop.w, crop.h));
-  const w = Math.max(1, Math.round(crop.w * k)), h = Math.max(1, Math.round(crop.h * k));
+/* Part of the image as you would save it (background, cutout and edits), at
+   most `max` px. rect may reach past the photo; that part shows the background colour. */
+function describeRect(rect, max) {
+  const k = Math.min(1, max / Math.max(rect.w, rect.h));
+  const w = Math.max(1, Math.round(rect.w * k)), h = Math.max(1, Math.round(rect.h * k));
   const c = makeCanvas(w, h), x = c.getContext('2d', { willReadFrequently: true });
   x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
-  x.setTransform(k, 0, 0, k, -crop.x * k, -crop.y * k);
+  x.setTransform(k, 0, 0, k, -rect.x * k, -rect.y * k);
   x.fillStyle = S.bg === 'custom' ? S.bgColor : (/^#/.test(S.bg) ? S.bg : '#ffffff');
-  x.fillRect(crop.x, crop.y, crop.w, crop.h);
+  x.fillRect(rect.x, rect.y, rect.w, rect.h);
   if (S.bg === 'photo') x.drawImage(photoCanvas(), 0, 0);
   else {
     if (S.bg === 'blur') { if (!S.blurCanvas) S.blurCanvas = makeBlur(); x.drawImage(S.blurCanvas, 0, 0, S.w, S.h); }
     x.drawImage(S.cutCanvas, 0, 0);
   }
   return { rgba: x.getImageData(0, 0, w, h).data, w, h };
+}
+const describeSource = (max) => describeRect(S.crop || fullRect(), max);
+/* A plain background's colour in words, for the prompt. */
+function plainName() {
+  const hex = S.bg === 'custom' ? S.bgColor : /^#/.test(S.bg) ? S.bg : '#ffffff';
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  const names = [['white', 255, 255, 255], ['black', 17, 17, 17], ['light grey', 200, 200, 200], ['grey', 128, 128, 128], ['dark grey', 64, 64, 64],
+    ['beige', 232, 226, 214], ['cream', 250, 240, 215], ['red', 200, 40, 40], ['pink', 240, 160, 180], ['orange', 240, 140, 40], ['yellow', 240, 220, 60],
+    ['green', 60, 160, 70], ['dark green', 30, 80, 40], ['teal', 40, 140, 140], ['light blue', 150, 200, 240], ['blue', 40, 90, 200], ['navy', 20, 30, 80],
+    ['purple', 120, 60, 170], ['brown', 120, 80, 50]];
+  let best = names[0], bd = Infinity;
+  for (const n of names) { const d = (n[1] - r) ** 2 + (n[2] - g) ** 2 + (n[3] - b) ** 2; if (d < bd) { bd = d; best = n; } }
+  return best[0];
+}
+/* What the description model looks at. A close-up of the subject first, so
+   the model sees its details at full size, then (when there is a real
+   background) the whole picture for the setting. Short prompts take one look. */
+function describeViews(style) {
+  const region = S.crop || fullRect();
+  const plain = S.bg !== 'photo' && S.bg !== 'blur';
+  const whole = (role) => Object.assign(describeSource(1024), { role });
+  if (style === 'short') return { views: [whole('short')], plain: null };
+  const box = subjectBox(region);
+  // A subject that fills the picture needs no close-up.
+  if (box.w * box.h >= 0.6 * region.w * region.h) return { views: [whole('subject')], plain: plain ? plainName() : null };
+  // A square around the subject with a margin. With a real background it stays inside the photo.
+  let side = Math.max(box.w, box.h) * 1.24;
+  const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+  let rect;
+  if (plain) rect = { x: cx - side / 2, y: cy - side / 2, w: side, h: side };
+  else {
+    const sw = Math.min(side, region.w), sh = Math.min(side, region.h);
+    rect = { x: clamp(cx - sw / 2, region.x, region.x + region.w - sw), y: clamp(cy - sh / 2, region.y, region.y + region.h - sh), w: sw, h: sh };
+  }
+  const close = Object.assign(describeRect(rect, 1024), { role: 'subject' });
+  return { views: plain ? [close] : [close, whole('scene')], plain: plain ? plainName() : null };
 }
 async function describeImage() {
   if (!STANDALONE || describer.busy || !S.cut || S.busy) return;
@@ -2309,8 +2391,8 @@ async function describeImage() {
   dsStatus(describer.ready ? 'Looking at the image' : 'Loading the description model');
   try {
     await ensureDescriber();
-    const src = describeSource(1024);
-    dsWorker().postMessage({ type: 'describe', rgba: src.rgba.buffer, w: src.w, h: src.h, style: describer.style }, [src.rgba.buffer]);
+    const { views, plain } = describeViews(describer.style);
+    dsWorker().postMessage({ type: 'describe', views, style: describer.style, plain }, views.map((v) => v.rgba.buffer));
   } catch (e) {
     describer.busy = false; dsStatus(''); updateDescribeUI();
     describeError(e && e.message ? e.message : String(e));
@@ -2886,6 +2968,9 @@ function updateUI() {
   $('rmUndo').disabled = $('undoBtn').disabled;
   $('rmCount').textContent = removed ? `${removed} removed` : (nSel ? `${nSel} selected` : 'None removed');
   $('chooseBtn').disabled = S.busy;
+  $('startOver').disabled = !ready || !hasEdits() || S.composing || S.removing || saving;
+  $('startOver').textContent = S.startArmed ? 'Tap again to start over' : 'Start over';
+  if (S.startArmed && $('startOver').disabled) { clearTimeout(S.startArmed); S.startArmed = 0; $('startOver').textContent = 'Start over'; }
   $('tryBtn').disabled = S.busy;
   for (const b of document.querySelectorAll('.hudseg button')) b.disabled = !ready || (S.tool === 'crop' && b.dataset.mode === 'compare');
   for (const b of document.querySelectorAll('button[data-tool]')) b.disabled = !ready && b.dataset.tool !== 'move';
@@ -2907,6 +2992,7 @@ function updateUI() {
 }
 
 $('chooseBtn').addEventListener('click', () => fileInput.click());
+$('startOver').addEventListener('click', startOver);
 $('tryBtn').addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => { const f = fileInput.files && fileInput.files[0]; fileInput.value = ''; if (f) handleFile(f); });
 for (const b of document.querySelectorAll('.hudseg [data-mode]')) b.addEventListener('click', () => setMode(b.dataset.mode));
@@ -3066,7 +3152,7 @@ if (STANDALONE && 'serviceWorker' in navigator) {
 }
 if (coarse) $('keepHint').textContent = 'Tap each object you want to keep. Everything else is removed. Tap the dot on an object to drop it.';
 if (coarse) $('rmHint').textContent = 'Tap each object you want to remove, or brush over smaller things like wires and marks. Tap a red area again to unselect it. Then tap Remove.';
-window.__clearcut = { S, engine, picker, fillers, describer, stickerImage: () => stickerImage(), resetSticker: () => { stickerCache = null; }, done: 0, picks: 0, selects: 0, removals: 0, describes: 0, errors: [], handleFile, pickAt, rmTap, removeSelected, restorePhoto, undo, redo, setBg, toScreen, setTool };
+window.__clearcut = { S, engine, picker, fillers, describer, startOver: () => startOver(), stickerImage: () => stickerImage(), resetSticker: () => { stickerCache = null; }, done: 0, picks: 0, selects: 0, removals: 0, describes: 0, errors: [], handleFile, pickAt, rmTap, removeSelected, restorePhoto, undo, redo, setBg, toScreen, setTool };
 readTokens();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readTokens);
 new MutationObserver(readTokens).observe(root, { attributes: true, attributeFilter: ['data-theme', 'class', 'style'] });
