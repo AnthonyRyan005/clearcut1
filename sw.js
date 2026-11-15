@@ -1,8 +1,8 @@
 /* Clearcut offline support. The app shell and runtime come from this cache.
    Model weights are stored by the app itself in IndexedDB, so this worker
    passes those large chunk downloads straight to the network. */
-const VERSION = 'clearcut-47cad80a02ab';
-const SHELL = ["./", "index.html", "worker.js", "describe-worker.js", "manifest.webmanifest", "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png", "icons/favicon-64.png", "vendor/ort/ort.webgpu.min.js", "vendor/ort/ort-wasm-simd-threaded.jsep.js", "vendor/ort/ort.wasm.min.js", "vendor/ort/ort-wasm-simd-threaded.js", "m/manifest.json", "m/graph.bin", "m/rt.bin", "m/rt-cpu.bin", "m/s-enc-graph.bin", "m/s-dec-graph.bin", "m/f-graph.bin"];
+const VERSION = 'clearcut-450370e76ac8';
+const SHELL = ["./", "index.html", "worker.js", "manifest.webmanifest", "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png", "icons/favicon-64.png", "vendor/ort/ort.webgpu.min.js", "vendor/ort/ort-wasm-simd-threaded.jsep.js", "vendor/ort/ort.wasm.min.js", "vendor/ort/ort-wasm-simd-threaded.js", "m/manifest.json", "m/graph.bin", "m/rt.bin", "m/rt-cpu.bin", "m/s-enc-graph.bin", "m/s-dec-graph.bin", "m/f-graph.bin"];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(VERSION).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -18,7 +18,7 @@ self.addEventListener('activate', (event) => {
 
 const isChunk = (url) => /\/m\/([a-z]+-)*w\d+\.bin$/.test(url.pathname);
 // The page, its worker and the model list always come from the network when online, so they never mix versions.
-const isFresh = (url, req) => req.mode === 'navigate' || /\/(index\.html|worker\.js|describe-worker\.js|m\/manifest\.json)$/.test(url.pathname) || url.pathname.endsWith('/');
+const isFresh = (url, req) => req.mode === 'navigate' || /\/(index\.html|worker\.js|m\/manifest\.json)$/.test(url.pathname) || url.pathname.endsWith('/');
 const isFont = (url) => url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com';
 
 async function networkFirst(req) {

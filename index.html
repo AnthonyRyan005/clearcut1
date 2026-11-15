@@ -186,6 +186,8 @@ button { cursor: pointer; }
   background: var(--ruby); color: var(--on-ruby); font-weight: 600; font-size: 13px;
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
 }
+.try.alt { background: var(--hud); color: var(--mat-text); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.try:disabled { opacity: 0.55; }
 
 .chip .spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid currentColor; border-top-color: transparent; animation: spin 0.9s linear infinite; flex: none; }
 .cropbar {
@@ -325,9 +327,6 @@ a.btn { text-decoration: none; }
 .bgname { font-size: 12.5px; color: var(--ink-soft); margin: 0; }
 
 .slider { display: grid; grid-template-columns: auto minmax(0, 1fr) 56px; align-items: center; gap: 10px; font-size: 13px; }
-.ds-controls { display: flex; flex-direction: column; gap: 10px; }
-.ds-out { width: 100%; min-height: 112px; resize: vertical; box-sizing: border-box; padding: 9px 11px; border-radius: 9px; border: 1px solid var(--rule); background: var(--paper-raised); color: var(--ink); font: 13px/1.45 var(--font-ui); }
-.ds-out:focus { outline: 2px solid var(--ruby); outline-offset: 1px; }
 .qrow { display: grid; grid-template-columns: 62px minmax(0, 1fr); align-items: center; gap: 10px; font-size: 13px; }
 .slider input { width: 100%; accent-color: var(--ruby); }
 .slider output { text-align: right; color: var(--ink-soft); }
@@ -365,6 +364,7 @@ a.btn { text-decoration: none; }
   .hud-tr { left: 12px; right: auto; }
   .wordmark { font-size: 23px; }
   .zoom .fitbtn { display: none; }
+  .hud-bl { flex-direction: column-reverse; align-items: flex-start; }
 }
 @media (pointer: coarse) {
   .seg kbd, .btn.tool kbd, .shortcuts { display: none; }
@@ -404,6 +404,7 @@ a.btn { text-decoration: none; }
         <button class="try" id="tryBtn" type="button">Try your own photo</button>
         <span class="chip" id="pickChip" hidden><span class="spin" aria-hidden="true"></span><span id="pickChipText">Preparing object picking</span></span>
         <button class="try" id="rmHud" type="button" hidden>Remove selected</button>
+        <button class="try alt" id="retryHud" type="button" hidden>Try again</button>
       </div>
       <div class="hud hud-br">
         <div class="zoom" role="group" aria-label="Zoom">
@@ -457,20 +458,30 @@ a.btn { text-decoration: none; }
       <section class="panel" aria-labelledby="hKeep">
         <h2 class="label" id="hKeep">Keep objects <span class="mono" id="keepCount">All found</span></h2>
         <button class="btn tool" type="button" data-tool="pick" aria-pressed="false" id="pickBtn">Pick objects to keep <kbd>W</kbd></button>
-        <p class="hint" id="keepHint">Click each object you want to keep. Everything else is removed. Click the dot on an object to drop it.</p>
+        <p class="hint" id="keepHint">Click each object you want to keep. Everything else is removed. Click the dot on an object to drop it. If the last pick isn't right, select Try again for a different one.</p>
         <p class="status" id="keepStatus" hidden><span class="spin" aria-hidden="true"></span><span id="keepStatusText"></span></p>
-        <div class="row"><button class="btn" type="button" id="keepClear" disabled>Clear picks</button></div>
+        <div class="slider" title="How far Try again strays from your tap, and from the model's most likely answer">
+          <label for="keepVary">Variation</label>
+          <input type="range" id="keepVary" min="0" max="100" step="5" value="50">
+          <output class="mono" id="keepVaryOut" for="keepVary">50%</output>
+        </div>
+        <div class="row"><button class="btn" type="button" id="keepRetry" disabled title="Pick the last object again, differently (T)">Try again</button><button class="btn" type="button" id="keepClear" disabled>Clear picks</button></div>
       </section>
 
       <section class="panel" aria-labelledby="hRemove">
         <h2 class="label" id="hRemove">Remove objects <span class="mono" id="rmCount">None removed</span></h2>
         <button class="btn tool" type="button" data-tool="remove" aria-pressed="false" id="rmBtn">Select objects to remove <kbd>X</kbd></button>
-        <p class="hint" id="rmHint">Click each object you want to remove, or brush over smaller things like wires and marks. Click a red area again to unselect it. Then select Remove.</p>
+        <p class="hint" id="rmHint">Click each object you want to remove, or brush over smaller things like wires and marks. Click a red area again to unselect it. If the last selection isn't right, select Try again for a different one. Then select Remove.</p>
         <p class="status" id="removeStatus" hidden><span class="spin" aria-hidden="true"></span><span id="removeStatusText"></span></p>
         <div class="slider">
           <label for="rmBrush">Brush</label>
           <input type="range" id="rmBrush" min="6" max="240" step="1" value="48">
           <output class="mono" id="rmBrushOut" for="rmBrush">48 px</output>
+        </div>
+        <div class="slider" title="How far Try again strays from your tap, and from the model's most likely answer">
+          <label for="rmVary">Variation</label>
+          <input type="range" id="rmVary" min="0" max="100" step="5" value="50">
+          <output class="mono" id="rmVaryOut" for="rmVary">50%</output>
         </div>
         <div class="qrow">
           <span id="rmGapLabel">Gap</span>
@@ -491,29 +502,13 @@ a.btn { text-decoration: none; }
         <label class="check" id="rmHiLabel" title="Runs Best at 1024 × 1024 pixels when a removal is person-sized on a big photo"><input type="checkbox" id="rmHi" checked> High resolution for large areas (slower)</label>
         <button class="btn primary" type="button" id="rmGo" disabled>Remove</button>
         <div class="row">
+          <button class="btn" type="button" id="rmRetry" disabled title="Select the last tapped object again, differently (T)">Try again</button>
           <button class="btn" type="button" id="rmClear" disabled title="Clear the selection">Clear</button>
+        </div>
+        <div class="row">
           <button class="btn" type="button" id="rmUndo" disabled>Undo</button>
           <button class="btn" type="button" id="rmReset" disabled title="Bring back everything you removed">Reset</button>
         </div>
-      </section>
-
-      <section class="panel" aria-labelledby="hDescribe">
-        <h2 class="label" id="hDescribe">Describe as prompt <span class="mono">PromptGen</span></h2>
-        <div class="ds-controls" id="dsControls">
-          <div class="seg" role="group" aria-label="Description style">
-            <button type="button" data-style="prompt" aria-pressed="true">Prompt</button>
-            <button type="button" data-style="detailed" aria-pressed="false">Detailed</button>
-            <button type="button" data-style="short" aria-pressed="false">Short</button>
-          </div>
-          <button class="btn primary" type="button" id="dsGo" disabled>Write prompt</button>
-          <p class="status" id="dsStatus" hidden><span class="spin" aria-hidden="true"></span><span id="dsStatusText"></span></p>
-          <textarea class="ds-out" id="dsOut" rows="6" placeholder="Your prompt appears here. You can edit it before you copy it." aria-label="Prompt for an image generator"></textarea>
-          <div class="row">
-            <button class="btn" type="button" id="dsCopy" disabled>Copy</button>
-            <button class="btn" type="button" id="dsStop" disabled>Stop</button>
-          </div>
-        </div>
-        <p class="hint" id="dsHint">Writes a prompt that an image generator can use to recreate this image. It looks at your subject close up, and at the whole picture when the background is a photo, then combines the two. For people, it adds their pose, movement and expression. Runs Florence-2 PromptGen on this device. The first use downloads about 270 MB from this app and keeps it for offline use. Check the details before you use the prompt, because the model can still get some wrong.</p>
       </section>
 
       <section class="panel" aria-labelledby="hCrop">
@@ -665,7 +660,7 @@ const S = {
   objects: [], objSeq: 0, composing: false, composeAgain: false, embedded: false,
   crop: null, draft: null, ratio: 'free', ratioTurned: false,
   timing: null, cutBusy: false,
-  sel: [], selSeq: 0, removing: false, editCanvas: null, editCtx: null, keptEdits: false, quality: 'best', gap: 'fill', detail: true, hi: true,
+  sel: [], selSeq: 0, variation: 0.5, removing: false, editCanvas: null, editCtx: null, keptEdits: false, quality: 'best', gap: 'fill', detail: true, hi: true,
 };
 let dpr = 1;
 let tok = {};
@@ -740,11 +735,7 @@ async function recycleWorker() {
   await workerReady;
 }
 let workerReady = Promise.resolve();
-/* Requests that load or run a large model. Before these, an idle describe
-   worker is closed so the two never hold their memory at the same time. */
-const HEAVY = new Set(['init', 'samInit', 'samEmbed', 'fillInit', 'cutout', 'removeFill']);
 function rpc(type, payload, transfer, onProgress) {
-  if (HEAVY.has(type)) { try { releaseDescriber(); } catch (e) { /* describe state not set up yet */ } }
   if (type !== 'refine' && type !== 'init' && type !== 'cutout') {
     return workerReady.then(() => rawRpc(type, payload, transfer, onProgress));
   }
@@ -781,6 +772,17 @@ async function idbGet(key) {
       q.onerror = () => resolve(null);
     });
   } catch (e) { return null; }
+}
+/* Deletes every stored entry whose key starts with prefix. */
+async function idbDropPrefix(prefix) {
+  try {
+    const db = await idbOpen();
+    await new Promise((resolve) => {
+      const tx = db.transaction('files', 'readwrite'), store = tx.objectStore('files'), all = store.getAllKeys();
+      all.onsuccess = () => { for (const k of all.result) if (String(k).startsWith(prefix)) store.delete(k); };
+      tx.oncomplete = resolve; tx.onerror = resolve; tx.onabort = resolve;
+    });
+  } catch (e) { /* storage unavailable */ }
 }
 /* Stores val under key and drops older versions that share its prefix. */
 async function idbPut(key, val) {
@@ -936,7 +938,10 @@ function updateChip() {
   $('rmHud').hidden = S.tool !== 'remove' || !n || S.removing;
   $('rmHud').textContent = n === 1 ? 'Remove 1 selected' : `Remove ${n} selected`;
   $('rmHud').disabled = S.sel.some((i) => i.pending);
-  $('tryBtn').hidden = !S.isExample || !!t || !$('rmHud').hidden;
+  const retry = retryTarget();
+  $('retryHud').hidden = !retry || S.removing;
+  $('retryHud').disabled = !retry || retry.pending || S.composing;
+  $('tryBtn').hidden = !S.isExample || !!t || !$('rmHud').hidden || !$('retryHud').hidden;
 }
 /* True when this browser should use ONNX Runtime's plain processor build. */
 const plainRuntime = (m) => WEBKIT && !!m.runtimeCpu;
@@ -1509,7 +1514,6 @@ function setPhoto(p) {
   S.history = []; S.future = []; S.historyBytes = 0;
   S.objects = []; S.embedded = false; S.composeAgain = false;
   S.sel = []; S.editCanvas = null; S.editCtx = null; S.keptEdits = false; rmStroke = null;
-  if ($('dsOut') && !describer.busy) $('dsOut').value = '';
   S.crop = null; S.draft = null; $('cropBar').hidden = true;
   if (S.tool !== 'move') { S.tool = 'move'; stage.dataset.tool = 'move'; S.autoMask = false; }
   S.view.fit = true; fitView();
@@ -1993,7 +1997,7 @@ async function rmTap(p) {
     if (!S.embedded) await ensureEmbedded(removeStatus);
     if (photo !== S.photoId || !S.sel.includes(it)) return;
     removeStatus('Finding the object');
-    const res = await rpc('removeSelect', { x: ip.x, y: ip.y });
+    const res = await rpc('removeSelect', { x: ip.x, y: ip.y, key: 'r' + it.id });
     if (photo !== S.photoId || !S.sel.includes(it)) return;
     if (res.empty) { dropSel(it); toast('Nothing to select there. Brush over it instead.', 3600); return; }
     if (res.frac > 0.45) { dropSel(it); toast('That selection covers most of the photo. Tap a smaller object, or brush over it.', 4600); return; }
@@ -2009,6 +2013,68 @@ async function rmTap(p) {
     afterSelChange();
   }
 }
+/* ---------- Try again ---------- */
+/* What Try again works on: the last tapped selection in the remove tool, or the
+   last picked object in the pick tool. */
+function retryTarget() {
+  if (S.tool === 'remove') { for (let i = S.sel.length - 1; i >= 0; i--) if (S.sel[i].kind === 'tap') return S.sel[i]; return null; }
+  if (S.tool === 'pick') return S.objects[S.objects.length - 1] || null;
+  return null;
+}
+/* Runs the object model again for that tap, from points scattered around it
+   (Variation sets how far), and keeps a mask it hasn't shown for this tap yet.
+   Each try uses a new random seed, so tapping again keeps finding new shapes. */
+async function retrySelection() {
+  const t = retryTarget();
+  if (!t || t.pending || !S.cut || S.busy || S.removing || (S.tool === 'pick' && S.composing)) return;
+  t.tries = (t.tries || 0) + 1;
+  const seed = (t.id * 7919 + t.tries * 104729 + Math.floor(Math.random() * 1e6)) >>> 0;
+  const photo = S.photoId;
+  t.pending = true;
+  updateUI(); updateChip(); schedule();
+  if (S.tool === 'remove') {
+    try {
+      removeStatus('Trying another selection');
+      const res = await rpc('removeSelect', { x: t.x, y: t.y, key: 'r' + t.id, retry: { variation: S.variation, seed } });
+      if (photo !== S.photoId || !S.sel.includes(t)) return;
+      if (res.empty) toast('Nothing else found there. Raise Variation and try again, or brush over it.', 4600);
+      else if (res.frac > 0.45) toast('That try covered most of the photo, so the last selection stays. Try again for another.', 4600);
+      else { t.rect = res.rect; t.mask = new Uint8Array(res.mask); t.overlay = selOverlay(t.rect, t.mask); window.__clearcut.retries++; }
+    } catch (e) {
+      console.error(e);
+      toast("Couldn't try again: " + (e && e.message ? e.message : e), 4600);
+      window.__clearcut.errors.push('retry: ' + (e && e.message || e));
+    } finally {
+      t.pending = false;
+      if (statusText.remove === 'Trying another selection') removeStatus('');
+      afterSelChange();
+    }
+    return;
+  }
+  let changed = false;
+  try {
+    pickStatus('Trying another pick');
+    const res = await rpc('repick', { objId: t.id, x: t.x, y: t.y, variation: S.variation, seed });
+    if (photo !== S.photoId || !S.objects.includes(t)) return;
+    if (res.empty) toast('Nothing else found there. Raise Variation and try again.', 4600);
+    else { changed = true; window.__clearcut.retries++; }
+  } catch (e) {
+    console.error(e);
+    toast("Couldn't try again: " + (e && e.message ? e.message : e), 4600);
+    window.__clearcut.errors.push('retry: ' + (e && e.message || e));
+  } finally {
+    if (statusText.pick === 'Trying another pick') pickStatus('');
+    if (!changed) { t.pending = false; updateUI(); updateChip(); schedule(); }
+  }
+  if (changed) recompose();
+}
+function setVariation(v) {
+  S.variation = Math.min(1, Math.max(0, v));
+  const pct = Math.round(S.variation * 100);
+  for (const id of ['keepVary', 'rmVary']) { $(id).value = pct; $(id + 'Out').textContent = pct + '%'; }
+  try { localStorage.setItem('clearcut.vary', String(pct)); } catch (e) { /* private mode */ }
+}
+
 function rmBegin(p0, p) {
   rmStroke = { r: Math.max(0.6, (S.brush / 2) / S.view.s), pts: [toImage(p0.x, p0.y)] };
   rmExtend(p);
@@ -2242,182 +2308,6 @@ async function startOver() {
     updateUI(); schedule();
   }
   if (!S.mask && id === S.photoId) runCutout();
-}
-
-/* ---------- describe as prompt (Florence-2 PromptGen, web app builds only) ---------- */
-const describer = { worker: null, busy: false, style: 'prompt', ready: false, promise: null, waitReady: null, idle: 0 };
-/* The description model uses about 0.8 GB on the processor. Close its worker
-   when another model needs memory, or after two idle minutes; the next prompt
-   starts it again from the copy saved on this device. */
-function releaseDescriber() {
-  clearTimeout(describer.idle);
-  if (!describer.worker || describer.busy || describer.waitReady) return;
-  describer.worker.terminate();
-  describer.worker = null; describer.ready = false; describer.promise = null;
-}
-const idleDescriber = () => { clearTimeout(describer.idle); describer.idle = setTimeout(releaseDescriber, 120000); };
-function dsStatus(text) { $('dsStatus').hidden = !text; $('dsStatusText').textContent = text || ''; }
-function updateDescribeUI() {
-  const ready = !!S.cut && !S.busy;
-  $('dsGo').disabled = !STANDALONE || !ready || describer.busy;
-  $('dsGo').textContent = describer.busy ? 'Writing…' : 'Write prompt';
-  $('dsStop').disabled = !describer.busy;
-  $('dsCopy').disabled = !$('dsOut').value.trim();
-}
-function dsWorker() {
-  if (describer.worker) return describer.worker;
-  const w = new Worker('describe-worker.js');
-  w.onmessage = (ev) => onDescribe(ev.data);
-  w.onerror = (ev) => {
-    const msg = ev.message || 'unknown error';
-    describer.busy = false; describer.worker = null; describer.ready = false; describer.promise = null; dsStatus(''); updateDescribeUI();
-    if (describer.waitReady) { describer.waitReady.reject(new Error(msg)); describer.waitReady = null; }
-    toast('The description model stopped: ' + msg, 4600);
-    window.__clearcut.errors.push('describe: ' + msg);
-  };
-  describer.worker = w;
-  return w;
-}
-function describeError(error) {
-  const net = /Failed to fetch|NetworkError|Load failed|HTTP|network|Download failed/i.test(error);
-  const mem = /memory|allocation|OOM|RangeError|out of/i.test(error);
-  toast(net ? "The description model couldn't be downloaded. Check your connection and try again."
-    : mem ? 'This device ran out of memory for the description model. Close other apps and try again.'
-    : "Couldn't write a prompt: " + error, 5600);
-  window.__clearcut.errors.push('describe: ' + error);
-}
-function onDescribe(m) {
-  if (m.type === 'status') dsStatus(m.text);
-  else if (m.type === 'ready') {
-    describer.ready = true; describer.device = m.device;
-    if (describer.waitReady) { describer.waitReady.resolve(); describer.waitReady = null; }
-  } else if (m.type === 'text') { $('dsOut').value = m.text; dsStatus('Writing'); updateDescribeUI(); }
-  else if (m.type === 'done') {
-    describer.busy = false; describer.device = m.device;
-    $('dsOut').value = m.text; dsStatus('');
-    window.__clearcut.lastDescribe = { ms: m.ms, encMs: m.encMs, device: m.device, chars: m.text.length, tokens: m.tokens };
-    window.__clearcut.describes++;
-    updateDescribeUI();
-    idleDescriber();
-  } else if (m.type === 'error') {
-    if (describer.waitReady) { describer.waitReady.reject(new Error(m.error)); describer.waitReady = null; return; }
-    describer.busy = false; dsStatus(''); updateDescribeUI();
-    describeError(m.error);
-    idleDescriber();
-  }
-}
-/* Download the model from this app (once; it is kept on the device), then start it in its worker. */
-function ensureDescriber() {
-  if (describer.ready) return Promise.resolve();
-  if (describer.promise) return describer.promise;
-  describer.promise = (async () => {
-    const m = await loadManifest();
-    const d = m.describe;
-    if (!d) throw new Error('The description model is missing from this version.');
-    const key = 'describe:' + d.version + ':' + d.enc.sha + d.dec.sha + d.emb.sha;
-    let files = await idbGet(key);
-    if (!files) {
-      const list = d.enc.chunks.concat([d.enc.graph], d.dec.chunks, [d.dec.graph], d.emb.chunks, [d.vocab]);
-      const total = list.reduce((a, c) => a + c[1], 0);
-      dsStatus(`Downloading the description model (${fmtMB(total)})`);
-      const blobs = await fetchAll(list, (dn, t) => dsStatus(`Downloading the description model · ${Math.floor((dn / t) * 100)}% of ${fmtMB(t)}`));
-      const ne = d.enc.chunks.length, nd = d.dec.chunks.length, nm = d.emb.chunks.length;
-      let i = 0;
-      const take = (n) => { const out = blobs.slice(i, i + n); i += n; return out; };
-      files = { encPack: new Blob(take(ne)), encGraph: take(1)[0], decPack: new Blob(take(nd)), decGraph: take(1)[0], embPack: new Blob(take(nm)), vocab: take(1)[0] };
-      idbPut(key, files);
-    }
-    if (!runtimeBlob) dsStatus('Loading the model runtime');
-    const runtime = await getRuntime(m);
-    dsStatus('Starting the description model');
-    const device = await pickDevice(134217728);
-    await new Promise((resolve, reject) => {
-      describer.waitReady = { resolve, reject };
-      dsWorker().postMessage({
-        type: 'load', runtime, device, plain: plainRuntime(m),
-        enc: { pack: files.encPack, graph: files.encGraph, man: packMan(d.enc) },
-        dec: { pack: files.decPack, graph: files.decGraph, man: packMan(d.dec) },
-        emb: { pack: files.embPack, man: packMan(d.emb) },
-        vocab: files.vocab,
-        info: { prompts: d.prompts, rows: d.rows, dim: d.dim, block: d.block },
-      });
-    });
-  })().catch((e) => { describer.promise = null; throw e; });
-  return describer.promise;
-}
-/* Part of the image as you would save it (background, cutout and edits), at
-   most `max` px. rect may reach past the photo; that part shows the background colour. */
-function describeRect(rect, max) {
-  const k = Math.min(1, max / Math.max(rect.w, rect.h));
-  const w = Math.max(1, Math.round(rect.w * k)), h = Math.max(1, Math.round(rect.h * k));
-  const c = makeCanvas(w, h), x = c.getContext('2d', { willReadFrequently: true });
-  x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
-  x.setTransform(k, 0, 0, k, -rect.x * k, -rect.y * k);
-  x.fillStyle = S.bg === 'custom' ? S.bgColor : (/^#/.test(S.bg) ? S.bg : '#ffffff');
-  x.fillRect(rect.x, rect.y, rect.w, rect.h);
-  if (S.bg === 'photo') x.drawImage(photoCanvas(), 0, 0);
-  else {
-    if (S.bg === 'blur') { if (!S.blurCanvas) S.blurCanvas = makeBlur(); x.drawImage(S.blurCanvas, 0, 0, S.w, S.h); }
-    x.drawImage(S.cutCanvas, 0, 0);
-  }
-  return { rgba: x.getImageData(0, 0, w, h).data, w, h };
-}
-const describeSource = (max) => describeRect(S.crop || fullRect(), max);
-/* A plain background's colour in words, for the prompt. */
-function plainName() {
-  const hex = S.bg === 'custom' ? S.bgColor : /^#/.test(S.bg) ? S.bg : '#ffffff';
-  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
-  const names = [['white', 255, 255, 255], ['black', 17, 17, 17], ['light grey', 200, 200, 200], ['grey', 128, 128, 128], ['dark grey', 64, 64, 64],
-    ['beige', 232, 226, 214], ['cream', 250, 240, 215], ['red', 200, 40, 40], ['pink', 240, 160, 180], ['orange', 240, 140, 40], ['yellow', 240, 220, 60],
-    ['green', 60, 160, 70], ['dark green', 30, 80, 40], ['teal', 40, 140, 140], ['light blue', 150, 200, 240], ['blue', 40, 90, 200], ['navy', 20, 30, 80],
-    ['purple', 120, 60, 170], ['brown', 120, 80, 50]];
-  let best = names[0], bd = Infinity;
-  for (const n of names) { const d = (n[1] - r) ** 2 + (n[2] - g) ** 2 + (n[3] - b) ** 2; if (d < bd) { bd = d; best = n; } }
-  return best[0];
-}
-/* What the description model looks at. A close-up of the subject first, so
-   the model sees its details at full size, then (when there is a real
-   background) the whole picture for the setting. Short prompts take one look. */
-function describeViews(style) {
-  const region = S.crop || fullRect();
-  const plain = S.bg !== 'photo' && S.bg !== 'blur';
-  const whole = (role) => Object.assign(describeSource(1024), { role });
-  if (style === 'short') return { views: [whole('short')], plain: null };
-  const box = subjectBox(region);
-  // A subject that fills the picture needs no close-up.
-  if (box.w * box.h >= 0.6 * region.w * region.h) return { views: [whole('subject')], plain: plain ? plainName() : null };
-  // A square around the subject with a margin. With a real background it stays inside the photo.
-  let side = Math.max(box.w, box.h) * 1.24;
-  const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
-  let rect;
-  if (plain) rect = { x: cx - side / 2, y: cy - side / 2, w: side, h: side };
-  else {
-    const sw = Math.min(side, region.w), sh = Math.min(side, region.h);
-    rect = { x: clamp(cx - sw / 2, region.x, region.x + region.w - sw), y: clamp(cy - sh / 2, region.y, region.y + region.h - sh), w: sw, h: sh };
-  }
-  const close = Object.assign(describeRect(rect, 1024), { role: 'subject' });
-  return { views: plain ? [close] : [close, whole('scene')], plain: plain ? plainName() : null };
-}
-async function describeImage() {
-  if (!STANDALONE || describer.busy || !S.cut || S.busy) return;
-  clearTimeout(describer.idle);
-  describer.busy = true;
-  $('dsOut').value = '';
-  updateDescribeUI();
-  dsStatus(describer.ready ? 'Looking at the image' : 'Loading the description model');
-  try {
-    await ensureDescriber();
-    const { views, plain } = describeViews(describer.style);
-    dsWorker().postMessage({ type: 'describe', views, style: describer.style, plain }, views.map((v) => v.rgba.buffer));
-  } catch (e) {
-    describer.busy = false; dsStatus(''); updateDescribeUI();
-    describeError(e && e.message ? e.message : String(e));
-  }
-}
-function setStyle(v) {
-  describer.style = v;
-  for (const b of document.querySelectorAll('[data-style]')) b.setAttribute('aria-pressed', String(b.dataset.style === v));
-  $('dsGo').textContent = describer.busy ? 'Writing…' : 'Write prompt';
 }
 
 /* ---------- crop ---------- */
@@ -2709,6 +2599,7 @@ window.addEventListener('keydown', (e) => {
   else if (k === 'r') setMode('result');
   else if (k === '\\') setMode('compare');
   else if (k === 'm') setMode('mask');
+  else if (k === 't' && (S.tool === 'pick' || S.tool === 'remove')) retrySelection();
   else if (k === '[') setBrush(S.brush * 0.85);
   else if (k === ']') setBrush(S.brush / 0.85);
   else if (k === '0') { S.view.fit = true; fitView(); schedule(); }
@@ -2993,6 +2884,11 @@ function updateUI() {
   for (const b of document.querySelectorAll('[data-ratio]')) b.disabled = !ready;
   $('cropFlip').disabled = !ready || S.ratio === 'free' || S.ratio === '1';
   $('keepClear').disabled = !ready || !S.objects.length || S.composing;
+  const lastPick = S.objects[S.objects.length - 1];
+  $('keepRetry').disabled = !ready || !lastPick || lastPick.pending || S.composing || S.tool !== 'pick';
+  let lastTap = null;
+  for (let i = S.sel.length - 1; i >= 0 && !lastTap; i--) if (S.sel[i].kind === 'tap') lastTap = S.sel[i];
+  $('rmRetry').disabled = !ready || !lastTap || lastTap.pending || S.removing || S.tool !== 'remove';
   const n = S.objects.length;
   $('keepCount').textContent = n ? `${n} picked` : 'All found';
   if (S.w) { const b = S.sticker && S.cut ? stickerImage() : cropBox(); $('outSize').textContent = fmtPx(b.w, b.h); }
@@ -3004,7 +2900,6 @@ function updateUI() {
     ? (S.bg === 'transparent' ? 'JPG has no transparency, so the background is saved as white.' : 'JPG files are smaller. The background is saved as shown.')
     : (S.bg === 'transparent' ? 'PNG keeps the transparent background.' : S.bg === 'photo' ? 'PNG of the whole photo, with your edits.' : 'PNG with the background shown.');
   updateCropUI();
-  updateDescribeUI();
 }
 
 $('chooseBtn').addEventListener('click', () => fileInput.click());
@@ -3050,23 +2945,13 @@ $('rmBrush').addEventListener('input', (e) => setBrush(+e.target.value));
 $('rmGo').addEventListener('click', removeSelected);
 $('rmHud').addEventListener('click', removeSelected);
 $('rmClear').addEventListener('click', clearSel);
+$('rmRetry').addEventListener('click', retrySelection);
+$('keepRetry').addEventListener('click', retrySelection);
+$('retryHud').addEventListener('click', retrySelection);
+for (const id of ['keepVary', 'rmVary']) $(id).addEventListener('input', (e) => setVariation(+e.target.value / 100));
+try { const v = localStorage.getItem('clearcut.vary'); if (v !== null && v !== '') setVariation(+v / 100); } catch (e) { /* private mode */ }
 $('rmReset').addEventListener('click', restorePhoto);
 $('rmUndo').addEventListener('click', undo);
-$('dsGo').addEventListener('click', describeImage);
-$('dsStop').addEventListener('click', () => { if (describer.worker) describer.worker.postMessage({ type: 'stop' }); });
-$('dsCopy').addEventListener('click', () => {
-  const t = $('dsOut').value.trim();
-  if (!t) return;
-  const done = () => toast('Prompt copied');
-  const fallback = () => { $('dsOut').focus(); $('dsOut').select(); toast('Press Copy on your keyboard menu to copy the selected prompt.', 3600); };
-  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done, fallback); else fallback();
-});
-$('dsOut').addEventListener('input', updateDescribeUI);
-for (const b of document.querySelectorAll('[data-style]')) b.addEventListener('click', () => setStyle(b.dataset.style));
-if (!STANDALONE) {
-  $('dsControls').hidden = true;
-  $('dsHint').textContent = 'Describe as prompt is in the iPad app. Its model is about 270 MB, too large for this version.';
-}
 function setGap(g) {
   S.gap = g === 'clear' ? 'clear' : 'fill';
   for (const b of document.querySelectorAll('[data-gap]')) b.setAttribute('aria-pressed', String(b.dataset.gap === S.gap));
@@ -3175,6 +3060,8 @@ $('engine').addEventListener('click', () => {
 });
 
 /* ---------- boot ---------- */
+// Earlier versions kept the prompt model (about 270 MB) on this device. It's no longer used, so free the space.
+if (STANDALONE) idbDropPrefix('describe:');
 if (STANDALONE && 'serviceWorker' in navigator) {
   /* After an update, the new offline worker takes over a moment after launch.
      Reload once then, so the page and its worker come from the same version.
@@ -3191,7 +3078,7 @@ if (STANDALONE && 'serviceWorker' in navigator) {
 }
 if (coarse) $('keepHint').textContent = 'Tap each object you want to keep. Everything else is removed. Tap the dot on an object to drop it.';
 if (coarse) $('rmHint').textContent = 'Tap each object you want to remove, or brush over smaller things like wires and marks. Tap a red area again to unselect it. Then tap Remove.';
-window.__clearcut = { S, engine, picker, fillers, describer, startOver: () => startOver(), stickerImage: () => stickerImage(), resetSticker: () => { stickerCache = null; }, done: 0, picks: 0, selects: 0, removals: 0, describes: 0, errors: [], handleFile, pickAt, rmTap, removeSelected, restorePhoto, undo, redo, setBg, toScreen, setTool };
+window.__clearcut = { S, engine, picker, fillers, retrySelection, setVariation, startOver: () => startOver(), stickerImage: () => stickerImage(), resetSticker: () => { stickerCache = null; }, done: 0, picks: 0, selects: 0, removals: 0, retries: 0, errors: [], handleFile, pickAt, rmTap, removeSelected, restorePhoto, undo, redo, setBg, toScreen, setTool };
 readTokens();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readTokens);
 new MutationObserver(readTokens).observe(root, { attributes: true, attributeFilter: ['data-theme', 'class', 'style'] });

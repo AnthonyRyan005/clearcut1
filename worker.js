@@ -432,6 +432,7 @@ function storeImage(rgba, w, h, mask, alpha) {
   const b = blobs(a256);
   img = {
     w, h, rgba: new Uint8ClampedArray(rgba), alpha: a8, a256, comp: b.comp, cell: b.cell, emb: null, objs: new Map(),
+    tries: new Map(),   // per selection: the masks (256 x 256) it has shown, so Try again finds something else
     edited: new Uint8Array(LOW * LOW),   // grid cells changed by object removal
     embStale: new Uint8Array(LOW * LOW), // ... and changed since the last embedding
   };
@@ -488,6 +489,69 @@ async function samPoint(x, y, id, whole) {
   if (whole) k = wholeObject(masks, iou, cands, ci, k);
   return { masks, iou, k, ci };
 }
+/* Try again: run EfficientSAM from points scattered around the tap, so it
+   answers a slightly different question each time, and take a mask that still
+   covers the tap but differs from every mask this selection has shown. The
+   model takes one point at a time; each run gives three masks (part, larger
+   part, whole object). variation (0..1) sets how far the points stray, up to
+   a tenth of the photo, and how freely the choice moves away from the model's
+   most confident mask. Returns { logits, bin } at 256 x 256, or null when
+   nothing new covers the tap. */
+async function samVaried(x, y, id, variation, avoid, seed) {
+  const px = x * LOW / img.w, py = y * LOW / img.h;
+  const ci = Math.min(LOW - 1, Math.max(0, Math.floor(py))) * LOW + Math.min(LOW - 1, Math.max(0, Math.floor(px)));
+  if (img.emb && img.embStale[ci]) { img.emb = null; img.embStale.fill(0); }
+  await ensureEmbedding(id);
+  const N = LOW * LOW, v = clampN(variation, 0, 1);
+  let st = (seed >>> 0) || 1;
+  const rnd = () => { st ^= st << 13; st ^= st >>> 17; st ^= st << 5; return (st >>> 0) / 4294967296; };
+  const R = 1.5 + v * 0.1 * LOW;
+  const pts = [[px, py]];
+  for (let t = 0; t < 9; t++) {
+    const a = rnd() * 2 * Math.PI, r = R * Math.sqrt(0.15 + 0.85 * rnd());
+    pts.push([clampN(px + r * Math.cos(a), 0, LOW - 1), clampN(py + r * Math.sin(a), 0, LOW - 1)]);
+  }
+  const iouOf = (a, an, b, bn) => { let i = 0; for (let j = 0; j < N; j++) i += a[j] & b[j]; return i / Math.max(1, an + bn - i); };
+  const avoidN = avoid.map((m) => { let c = 0; for (let j = 0; j < N; j++) c += m[j]; return c; });
+  const cands = [];
+  for (const [qx, qy] of pts) {
+    const res = await sam.dec.run({
+      image_embeddings: img.emb,
+      batched_point_coords: new ort.Tensor('float32', new Float32Array([qx, qy]), [1, 1, 1, 2]),
+      batched_point_labels: new ort.Tensor('float32', new Float32Array([1]), [1, 1, 1]),
+    });
+    const masks = res.output_masks.data, iou = res.iou_predictions.data;
+    for (let k = 0; k < 3; k++) {
+      if (!(masks[k * N + ci] > 0)) continue;   // it must still cover the tap
+      const bin = new Uint8Array(N);
+      let area = 0;
+      for (let j = 0; j < N; j++) if (masks[k * N + j] > 0) { bin[j] = 1; area++; }
+      if (area < 0.0004 * N || area > 0.6 * N) continue;
+      if (cands.some((c) => iouOf(c.bin, c.area, bin, area) > 0.9)) continue;   // already have it
+      let near = 0;
+      avoid.forEach((m, i) => { near = Math.max(near, iouOf(m, avoidN[i], bin, area)); });
+      cands.push({ bin, area, iou: iou[k], novel: 1 - near, logits: new Float32Array(masks.subarray(k * N, (k + 1) * N)) });
+    }
+  }
+  // Something new first: masks that overlap every earlier one by less than 70%.
+  let pool = cands.filter((c) => c.novel >= 0.3);
+  if (!pool.length) pool = cands.filter((c) => c.novel >= 0.1);
+  if (!pool.length) return null;
+  // Confident masks are likelier, the more so the lower the variation.
+  const T = 0.04 + 0.3 * v;
+  const wts = pool.map((c) => Math.exp((c.iou + 0.25 * c.novel) / T));
+  let pick = rnd() * wts.reduce((a, b) => a + b, 0), chosen = pool[0];
+  for (let i = 0; i < pool.length; i++) { pick -= wts[i]; if (pick <= 0) { chosen = pool[i]; break; } }
+  return { logits: chosen.logits, bin: chosen.bin };
+}
+function remember(key, bin) {
+  if (!key) return;
+  const list = img.tries.get(key) || [];
+  list.push(bin);
+  img.tries.set(key, list.slice(-12));
+}
+const binOf = (logits) => { const b = new Uint8Array(logits.length); for (let j = 0; j < b.length; j++) b[j] = logits[j] > 0 ? 1 : 0; return b; };
+
 /* Removing: a tap on someone's shirt means the whole person. On a subject the
    background model found, take the mask that covers most of that subject while
    staying inside it. Elsewhere, take the largest mask the model is reasonably
@@ -516,7 +580,18 @@ function wholeObject(masks, iou, cands, ci, k0) {
 /* One click -> one kept object. Clicks on detected foreground keep that blob
    with its fine matte (or a confident part of it); clicks elsewhere keep the
    object EfficientSAM finds there. */
-async function analyseClick(x, y, id) {
+async function analyseClick(x, y, id, retry = null, key = null) {
+  if (retry) {
+    const r = await samVaried(x, y, id, retry.variation, img.tries.get(key) || [], retry.seed);
+    if (!r) return null;
+    remember(key, r.bin);
+    return { kind: 'new', logits: r.logits };
+  }
+  const c = await analyseFirst(x, y, id);
+  remember(key, c.kind === 'new' ? binOf(c.logits) : c.region);
+  return c;
+}
+async function analyseFirst(x, y, id) {
   const { masks, iou, k, ci } = await samPoint(x, y, id);
   const N = LOW * LOW;
   const L = img.comp[ci];
@@ -746,13 +821,21 @@ async function runFill(kind, input, D = FILL) {
 /* What a tap removes: the object EfficientSAM finds there. When that object is
    a whole foreground blob, its fine matte joins in, so hair and soft edges go
    too. The area then grows a little to catch halos and blurred edges. */
-async function removalArea(x, y, id) {
+async function removalArea(x, y, id, retry = null, key = null) {
   const { w, h } = img;
-  const { masks, k, ci } = await samPoint(x, y, id, true);
   const N = LOW * LOW;
-  const lg = masks.subarray(k * N, (k + 1) * N);
-  let L = -1;
-  if (img.a256[ci] >= 0.5 && img.comp[ci] >= 0 && !img.edited[ci]) {
+  let lg, ci, L = -1;
+  if (retry) {
+    // Try again: the varied mask as it is, without widening it to the subject.
+    const r = await samVaried(x, y, id, retry.variation, img.tries.get(key) || [], retry.seed);
+    if (!r) return null;
+    lg = r.logits;
+    ci = Math.min(LOW - 1, Math.max(0, Math.floor(y * LOW / h))) * LOW + Math.min(LOW - 1, Math.max(0, Math.floor(x * LOW / w)));
+  } else {
+    const sp = await samPoint(x, y, id, true);
+    lg = sp.masks.subarray(sp.k * N, (sp.k + 1) * N); ci = sp.ci;
+  }
+  if (!retry && img.a256[ci] >= 0.5 && img.comp[ci] >= 0 && !img.edited[ci]) {
     const C = img.comp[ci];
     let inter = 0, size = 0;
     for (let j = 0; j < N; j++) if (img.comp[j] === C) { size++; if (lg[j] > 0) inter++; }
@@ -766,6 +849,11 @@ async function removalArea(x, y, id) {
     }
   }
   if (gx1 < 0) return null;
+  if (key) {
+    const bin = new Uint8Array(N);
+    for (let j = 0; j < N; j++) bin[j] = lg[j] > 0 || (L >= 0 && img.cell[j] === L && img.a256[j] > 0.02) ? 1 : 0;
+    remember(key, bin);
+  }
   const sx = w / LOW, sy = h / LOW;
   const grow = Math.round(Math.min(40, Math.max(3, Math.max(w, h) * 0.005)) + (L >= 0 ? 0 : 0.6 * Math.max(sx, sy)));
   const x0 = Math.max(0, Math.floor((gx0 - 1) * sx) - grow - 1), y0 = Math.max(0, Math.floor((gy0 - 1) * sy) - grow - 1);
@@ -1672,6 +1760,22 @@ const handlers = {
   },
 
   /* Rebuild the cutout from the current list of picked objects. */
+  /* Try again for a kept object: a different mask from points around its tap.
+     The next select uses it. */
+  async repick(m) {
+    if (!img) throw new Error('No photo is loaded.');
+    if (!sam) throw new Error('The picking model is not loaded yet.');
+    const key = 'k' + m.objId;
+    if (!img.tries.has(key) && img.objs.has(m.objId)) {
+      const c = img.objs.get(m.objId);
+      remember(key, c.kind === 'new' ? binOf(c.logits) : c.region);
+    }
+    const c = await analyseClick(m.x, m.y, m.id, { variation: m.variation, seed: m.seed }, key);
+    if (!c) return [{ empty: true }];
+    img.objs.set(m.objId, c);
+    return [{ kind: c.kind }];
+  },
+
   async select(m) {
     if (!img) throw new Error('No photo is loaded.');
     const objs = [];
@@ -1679,7 +1783,7 @@ const handlers = {
       await ensureEmbedding(m.id);
       for (const o of m.objects) {
         let c = img.objs.get(o.id);
-        if (!c) { c = await analyseClick(o.x, o.y, m.id); img.objs.set(o.id, c); }
+        if (!c) { c = await analyseClick(o.x, o.y, m.id, null, 'k' + o.id); img.objs.set(o.id, c); }
         objs.push(c);
       }
     }
@@ -1713,7 +1817,7 @@ const handlers = {
   async removeSelect(m) {
     if (!img) throw new Error('No photo is loaded.');
     if (!sam) throw new Error('The picking model is not loaded yet.');
-    const r = await removalArea(m.x, m.y, m.id);
+    const r = await removalArea(m.x, m.y, m.id, m.retry || null, m.key || null);
     if (!r) return [{ empty: true }];
     return [{ rect: r.rect, mask: r.mask.buffer, frac: r.area / (img.w * img.h) }, [r.mask.buffer]];
   },
